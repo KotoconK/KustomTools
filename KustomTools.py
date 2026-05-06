@@ -4,7 +4,7 @@ bl_info = {
     "version": (1, 0, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Kustom Tools",
-    "description": "Orient the 3D Cursor rotation to the face under the mouse without moving it or losing selection",
+    "description": "Orient Cursor tools and basic color settings to improve experience",
     "category": "3D View",
 }
 
@@ -67,8 +67,14 @@ class CT_OT_enable_dynamic_bg(bpy.types.Operator):
     bl_label = "Apply Edit Background"
 
     def execute(self, context):
+
         context.scene.ct_bg_enabled = True
-        update_viewport_background()
+
+        # 🔹 Forzar actualización inmediata
+        viewport_mode_handler(context.scene)
+
+        self.report({'INFO'}, "Edit Mode background enabled")
+
         return {'FINISHED'}
 
 
@@ -427,7 +433,7 @@ class VIEW3D_OT_cursor_align_set_origin_geometry(bpy.types.Operator):
 class VIEW3D_OT_cursor_align_snap_mid(bpy.types.Operator):
     bl_idname = "view3d.cursor_align_snap_mid"
     bl_label = "Snap Point"
-    bl_description = "Transform tool + Local orientation + Vertex snap (Median)"
+    bl_description = "Origin to Cursor + Vertex snap (Median)"
 
     def execute(self, context):
         activate_snap_mid_mode(context)
@@ -445,6 +451,35 @@ class VIEW3D_OT_cursor_align_origin_to_cursor(bpy.types.Operator):
             self.report({'INFO'}, "Origin set to cursor")
         except Exception:
             self.report({'WARNING'}, "Failed (Object Mode required)")
+        return {'FINISHED'}
+    
+class VIEW3D_OT_selection_to_cursor(bpy.types.Operator):
+    bl_idname = "view3d.selection_to_cursor"
+    bl_label = "Geo to Cursor"
+    bl_description = "Move selection to 3D Cursor"
+
+    def execute(self, context):
+        try:
+            bpy.ops.view3d.snap_selected_to_cursor(use_offset=False)
+            self.report({'INFO'}, "Selection moved to cursor")
+        except Exception as e:
+            self.report({'WARNING'}, str(e))
+
+        return {'FINISHED'}
+
+
+class VIEW3D_OT_cursor_to_selected(bpy.types.Operator):
+    bl_idname = "view3d.cursor_to_selected"
+    bl_label = "Cursor to Selected"
+    bl_description = "Move 3D Cursor to selection"
+
+    def execute(self, context):
+        try:
+            bpy.ops.view3d.snap_cursor_to_selected()
+            self.report({'INFO'}, "Cursor moved to selection")
+        except Exception as e:
+            self.report({'WARNING'}, str(e))
+
         return {'FINISHED'}
 # ------------------------------------------------------------
 # Keymap
@@ -482,7 +517,7 @@ def update_enabled(self, context):
     if context.scene.cursor_align_enabled:
         apply_user_setup(context)
         register_keymaps()
-        set_status(context, "Enabled")
+        set_status(context, "Use Alt+Shift+MMB to align cursor to face")
     else:
         unregister_keymaps()
         set_status(context, "Disabled")
@@ -538,58 +573,24 @@ class VIEW3D_PT_cursor_align_sidebar(bpy.types.Panel):
         # 👉 fila  (Snap SOLO)
         row = col.row(align=True)
         row.operator("view3d.cursor_align_snap_mid", icon='SNAP_VERTEX')
-
+        
+        # 👉 Selection / Cursor
+        row = col.row(align=True)
+        row.operator("view3d.selection_to_cursor", icon='MESH_CUBE')
+        row.operator("view3d.cursor_to_selected", icon='CURSOR')
         col.separator()
 
         status_box = col.box()
         status_box.label(text="Status", icon='INFO')
         status_box.label(text=scene.cursor_align_status)
-
-        col.separator()
-
-        info_box = col.box()
-        info_box.prop(
-            scene,
-            "cursor_align_info_expanded",
-            text="Info",
-            icon='TRIA_DOWN' if scene.cursor_align_info_expanded else 'TRIA_RIGHT',
-            emboss=False
-        )
-
-        if scene.cursor_align_info_expanded:
-            inner = info_box.column(align=True)
-
-            inner.separator()
-            inner.label(text="Shortcut", icon='MOUSE_MMB')
-            inner.label(text="Alt + Shift + MMB")
-
-            inner.separator()
-            inner.label(text="Edit Cursor", icon='CURSOR')
-            inner.label(text="Tool: 3D Cursor")
-            inner.label(text="Snap: Vertex ON")
-
-            inner.separator()
-            inner.label(text="Use Cursor", icon='PIVOT_CURSOR')
-            inner.label(text="Tool: Transform")
-            inner.label(text="Pivot: 3D Cursor")
-            inner.label(text="Snap: OFF")
-
-            inner.separator()
-            inner.label(text="Reset", icon='LOOP_BACK')
-            inner.label(text="Tool: Transform")
-            inner.label(text="Orientation: Normal")
-            inner.label(text="Pivot: Active Element")
-            inner.label(text="Snap: OFF")
-
-            inner.separator()
-            inner.label(text="Developed by Álvaro A.R", icon='INFO')
-        
+               
 class VIEW3D_PT_viewport_tools(bpy.types.Panel):
     bl_label = "Viewport Tools"
     bl_idname = "VIEW3D_PT_viewport_tools"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = "KustomTools"
+    bl_options = {'DEFAULT_CLOSED'}
 
     def draw(self, context):
         layout = self.layout
@@ -600,14 +601,123 @@ class VIEW3D_PT_viewport_tools(bpy.types.Panel):
         # 🎨 Edit Mode Background
         box = col.box()
         box.label(text="Edit Mode BG", icon='SHADING_RENDERED')
-        box.prop(scene, "ct_edit_bg_color", text="")
-        box.operator("ct.enable_dynamic_bg", icon='BRUSH_DATA')
+        row = box.row(align=True)
+
+        row.prop(scene, "ct_edit_bg_color", text="")
+
+        row.operator(
+            "ct.enable_dynamic_bg",
+            text="",
+            icon='PLAY'
+        )
 
         # 🎨 Active Object Color
         box = col.box()
         box.label(text="Active Object Color", icon='COLOR')
-        box.prop(scene, "ct_active_obj_color", text="")
-        box.operator("ct.set_active_object_color")
+
+        row = box.row(align=True)
+
+        row.prop(scene, "ct_active_obj_color", text="")
+
+        row.operator(
+            "ct.set_active_object_color",
+            text="",
+            icon='CHECKMARK'
+        )
+
+class VIEW3D_PT_info_panel(bpy.types.Panel):
+    bl_label = "Info"
+    bl_idname = "VIEW3D_PT_info_panel"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "KustomTools"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+
+        layout = self.layout
+        col = layout.column(align=True)
+
+        # ------------------------------------------------------------
+        # SHORTCUT
+        # ------------------------------------------------------------
+        col.separator()
+        col.label(text="Shortcut", icon='MOUSE_MMB')
+        col.label(text="Alt + Shift + MMB")
+
+        # ------------------------------------------------------------
+        # EDIT CURSOR
+        # ------------------------------------------------------------
+        col.separator()
+        col.label(text="Edit Cursor", icon='CURSOR')
+        col.label(text="Tool: 3D Cursor")
+        col.label(text="Snap: Vertex")
+        col.label(text="Target: Closest")
+
+        # ------------------------------------------------------------
+        # USE ORIGIN
+        # ------------------------------------------------------------
+        col.separator()
+        col.label(text="Use Origin", icon='OBJECT_ORIGIN')
+        col.label(text="Tool: Transform")
+        col.label(text="Orientation: Cursor")
+        col.label(text="Pivot: Active Element")
+
+        # ------------------------------------------------------------
+        # USE CURSOR
+        # ------------------------------------------------------------
+        col.separator()
+        col.label(text="Use Cursor", icon='PIVOT_CURSOR')
+        col.label(text="Tool: Transform")
+        col.label(text="Pivot: 3D Cursor")
+        col.label(text="Snap: OFF")
+
+        # ------------------------------------------------------------
+        # ORIGIN TOOLS
+        # ------------------------------------------------------------
+        col.separator()
+        col.label(text="Origin to Geo", icon='OBJECT_ORIGIN')
+        col.label(text="Set origin to geometry")
+
+        col.separator()
+        col.label(text="Origin to Cursor", icon='CURSOR')
+        col.label(text="Set origin to 3D Cursor")
+
+        # ------------------------------------------------------------
+        # SNAP POINT
+        # ------------------------------------------------------------
+        col.separator()
+        col.label(text="Snap Point", icon='SNAP_VERTEX')
+        col.label(text="Snap: Vertex")
+        col.label(text="Target: Center")
+        col.label(text="Orientation: Local")
+
+        # ------------------------------------------------------------
+        # SELECTION / CURSOR
+        # ------------------------------------------------------------
+        col.separator()
+        col.label(text="Geo to Cursor", icon='MESH_CUBE')
+        col.label(text="Move selection to Cursor")
+
+        col.separator()
+        col.label(text="Cursor to Selected", icon='CURSOR')
+        col.label(text="Move Cursor to selection")
+
+        # ------------------------------------------------------------
+        # RESET
+        # ------------------------------------------------------------
+        col.separator()
+        col.label(text="Reset", icon='LOOP_BACK')
+        col.label(text="Tool: Transform")
+        col.label(text="Orientation: Normal")
+        col.label(text="Pivot: Active Element")
+        col.label(text="Snap: OFF")
+
+        # ------------------------------------------------------------
+        # AUTHOR
+        # ------------------------------------------------------------
+        col.separator()
+        col.label(text="Developed by Álvaro_A", icon='INFO')
 
 # ------------------------------------------------------------
 # Register
@@ -624,6 +734,9 @@ classes = (
     VIEW3D_PT_cursor_align_sidebar,
     VIEW3D_PT_viewport_tools,
     VIEW3D_OT_cursor_align_origin_to_cursor,
+    VIEW3D_OT_selection_to_cursor,
+    VIEW3D_OT_cursor_to_selected,
+    VIEW3D_PT_info_panel,
     CT_OT_enable_dynamic_bg,
     CT_OT_set_active_object_color,
 )
