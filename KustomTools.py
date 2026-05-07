@@ -1,8 +1,8 @@
 bl_info = {
     "name": "KustomTools",
     "author": "Álvaro_A",
-    "version": (1, 0, 0),
-    "blender": (4, 0, 0),
+    "version": (1, 1, 0),
+    "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Kustom Tools",
     "description": "Orient Cursor tools and basic color settings to improve experience",
     "category": "3D View",
@@ -355,7 +355,7 @@ class VIEW3D_OT_cursor_orient_to_face_under_mouse(bpy.types.Operator):
 
 class VIEW3D_OT_cursor_align_apply_setup(bpy.types.Operator):
     bl_idname = "view3d.cursor_align_apply_setup"
-    bl_label = "Use Origin"
+    bl_label = "◎ Use Origin"
     bl_description = "Apply Transform tool, Individual Origins and Cursor orientation"
 
     def execute(self, context):
@@ -383,7 +383,7 @@ class VIEW3D_OT_cursor_align_edit_cursor(bpy.types.Operator):
 
 class VIEW3D_OT_cursor_align_use_cursor(bpy.types.Operator):
     bl_idname = "view3d.cursor_align_use_cursor"
-    bl_label = "Use Cursor"
+    bl_label = "✢ Use Cursor"
     bl_description = "Activate Transform tool, set Pivot to 3D Cursor and disable Snap"
 
     def execute(self, context):
@@ -405,7 +405,7 @@ class VIEW3D_OT_cursor_align_reset(bpy.types.Operator):
 
 class VIEW3D_OT_cursor_align_origin_to_geometry(bpy.types.Operator):
     bl_idname = "view3d.cursor_align_origin_to_geometry"
-    bl_label = "Origin to Geo"
+    bl_label = "◎ → ◼"
     bl_description = "Set object origin to geometry"
 
     def execute(self, context):
@@ -432,7 +432,7 @@ class VIEW3D_OT_cursor_align_set_origin_geometry(bpy.types.Operator):
 
 class VIEW3D_OT_cursor_align_snap_mid(bpy.types.Operator):
     bl_idname = "view3d.cursor_align_snap_mid"
-    bl_label = "Snap Point"
+    bl_label = "Snap Point | ◎ → ✢"
     bl_description = "Origin to Cursor + Vertex snap (Median)"
 
     def execute(self, context):
@@ -442,7 +442,7 @@ class VIEW3D_OT_cursor_align_snap_mid(bpy.types.Operator):
     
 class VIEW3D_OT_cursor_align_origin_to_cursor(bpy.types.Operator):
     bl_idname = "view3d.cursor_align_origin_to_cursor"
-    bl_label = "Origin to Cursor"
+    bl_label = "◎ → ✢"
     bl_description = "Set object origin to 3D cursor"
 
     def execute(self, context):
@@ -455,7 +455,7 @@ class VIEW3D_OT_cursor_align_origin_to_cursor(bpy.types.Operator):
     
 class VIEW3D_OT_selection_to_cursor(bpy.types.Operator):
     bl_idname = "view3d.selection_to_cursor"
-    bl_label = "Geo to Cursor"
+    bl_label = "◼ → ✢"
     bl_description = "Move selection to 3D Cursor"
 
     def execute(self, context):
@@ -470,7 +470,7 @@ class VIEW3D_OT_selection_to_cursor(bpy.types.Operator):
 
 class VIEW3D_OT_cursor_to_selected(bpy.types.Operator):
     bl_idname = "view3d.cursor_to_selected"
-    bl_label = "Cursor to Selected"
+    bl_label = "✢ → ▣"
     bl_description = "Move 3D Cursor to selection"
 
     def execute(self, context):
@@ -545,7 +545,7 @@ class VIEW3D_PT_cursor_align_sidebar(bpy.types.Panel):
         # ------------------------------------------------------------
         row = col.row()
         row.scale_y = 1.3
-        row.prop(scene, "cursor_align_enabled", text="ON", toggle=True, icon='ORIENTATION_CURSOR')
+        row.prop(scene, "cursor_align_enabled", text="Copy cursor rot", toggle=True, icon='ORIENTATION_CURSOR')
 
         # ------------------------------------------------------------
         # USE ORIGIN / RESET
@@ -560,24 +560,24 @@ class VIEW3D_PT_cursor_align_sidebar(bpy.types.Panel):
 
         # 👉 fila 
         row = col.row(align=True)
-        row.operator("view3d.cursor_align_apply_setup", text="Use Origin", icon='OBJECT_ORIGIN')
-        row.operator("view3d.cursor_align_use_cursor", icon='PIVOT_CURSOR')
+        row.operator("view3d.cursor_align_apply_setup")
+        row.operator("view3d.cursor_align_use_cursor")
         
         col.separator()
 
         # 👉 fila  (Origins)
         row = col.row(align=True)
-        row.operator("view3d.cursor_align_origin_to_geometry", icon='OBJECT_ORIGIN')
-        row.operator("view3d.cursor_align_origin_to_cursor", icon='CURSOR')
+        row.operator("view3d.cursor_align_origin_to_geometry")
+        row.operator("view3d.cursor_align_origin_to_cursor")
 
         # 👉 fila  (Snap SOLO)
         row = col.row(align=True)
-        row.operator("view3d.cursor_align_snap_mid", icon='SNAP_VERTEX')
+        row.operator("view3d.cursor_align_snap_mid")
         
         # 👉 Selection / Cursor
         row = col.row(align=True)
-        row.operator("view3d.selection_to_cursor", icon='MESH_CUBE')
-        row.operator("view3d.cursor_to_selected", icon='CURSOR')
+        row.operator("view3d.selection_to_cursor")
+        row.operator("view3d.cursor_to_selected")
         col.separator()
 
         status_box = col.box()
@@ -622,7 +622,7 @@ class VIEW3D_PT_viewport_tools(bpy.types.Panel):
         row.operator(
             "ct.set_active_object_color",
             text="",
-            icon='CHECKMARK'
+            icon='PLAY'
         )
 
 class VIEW3D_PT_info_panel(bpy.types.Panel):
