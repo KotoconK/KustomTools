@@ -1,9 +1,8 @@
-ADDON_VERSION = (1, 2, 2)
 
 bl_info = {
     "name": "KustomTools",
     "author": "Álvaro_A",
-    "version": ADDON_VERSION,
+    "version": (1, 2, 3),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Kustom Tools",
     "description": "Orient Cursor tools and basic color settings to improve experience",
@@ -17,6 +16,7 @@ import os
 from mathutils.bvhtree import BVHTree
 from bpy_extras import view3d_utils
 
+ADDON_VERSION = bl_info["version"]
 addon_keymaps = []
 
 # ------------------------------------------------------------
