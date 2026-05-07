@@ -1,7 +1,7 @@
 bl_info = {
     "name": "KustomTools",
     "author": "Álvaro_A",
-    "version": (1, 1, 0),
+    "version": (1, 2, 0),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Kustom Tools",
     "description": "Orient Cursor tools and basic color settings to improve experience",
@@ -10,8 +10,11 @@ bl_info = {
 
 import bpy
 import bmesh
+import urllib.request
+import os
 from mathutils.bvhtree import BVHTree
 from bpy_extras import view3d_utils
+
 
 addon_keymaps = []
 
@@ -481,6 +484,42 @@ class VIEW3D_OT_cursor_to_selected(bpy.types.Operator):
             self.report({'WARNING'}, str(e))
 
         return {'FINISHED'}
+    
+class KT_OT_update_addon(bpy.types.Operator):
+    bl_idname = "kt.update_addon"
+    bl_label = "Update KustomTools"
+
+    def execute(self, context):
+
+        try:
+
+            # ------------------------------------------------
+            # URL RAW GITHUB
+            # ------------------------------------------------
+            url = "https://raw.githubusercontent.com/KotoconK/KustomTools/main/KustomTools.py"
+
+            # ------------------------------------------------
+            # RUTA ADDON ACTUAL
+            # ------------------------------------------------
+            addon_path = __file__
+
+            # ------------------------------------------------
+            # DESCARGAR Y REEMPLAZAR
+            # ------------------------------------------------
+            urllib.request.urlretrieve(url, addon_path)
+
+            # ------------------------------------------------
+            # RECARGAR SCRIPTS
+            # ------------------------------------------------
+            bpy.ops.script.reload()
+
+            self.report({'INFO'}, "KustomTools updated")
+
+        except Exception as e:
+
+            self.report({'ERROR'}, str(e))
+
+        return {'FINISHED'}
 # ------------------------------------------------------------
 # Keymap
 # ------------------------------------------------------------
@@ -639,6 +678,16 @@ class VIEW3D_PT_info_panel(bpy.types.Panel):
         col = layout.column(align=True)
 
         # ------------------------------------------------------------
+        # UPDATER
+        # ------------------------------------------------------------
+        col.separator()
+
+        col.operator(
+            "kt.update_addon",
+            text="Check Update",
+            icon='IMPORT'
+        )
+        # ------------------------------------------------------------
         # SHORTCUT
         # ------------------------------------------------------------
         col.separator()
@@ -739,6 +788,7 @@ classes = (
     VIEW3D_PT_info_panel,
     CT_OT_enable_dynamic_bg,
     CT_OT_set_active_object_color,
+    KT_OT_update_addon,
 )
 
 
