@@ -1,7 +1,9 @@
+ADDON_VERSION = (1, 2, 2)
+
 bl_info = {
     "name": "KustomTools",
     "author": "Álvaro_A",
-    "version": (1, 2, 1),
+    "version": ADDON_VERSION,
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Kustom Tools",
     "description": "Orient Cursor tools and basic color settings to improve experience",
@@ -14,7 +16,6 @@ import urllib.request
 import os
 from mathutils.bvhtree import BVHTree
 from bpy_extras import view3d_utils
-
 
 addon_keymaps = []
 
@@ -681,6 +682,14 @@ class VIEW3D_PT_info_panel(bpy.types.Panel):
         # ------------------------------------------------------------
         # UPDATER
         # ------------------------------------------------------------
+        col.separator()
+
+        version_str = ".".join(map(str, ADDON_VERSION))
+
+        col.label(
+            text=f"Version {version_str}",
+            icon='BLENDER'
+        )
         col.separator()
 
         col.operator(
