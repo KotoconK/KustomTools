@@ -1,7 +1,7 @@
 bl_info = {
     "name": "KustomTools",
     "author": "Álvaro_A",
-    "version": (1, 2, 0),
+    "version": (1, 2, 1),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Kustom Tools",
     "description": "Orient Cursor tools and basic color settings to improve experience",
@@ -511,6 +511,7 @@ class KT_OT_update_addon(bpy.types.Operator):
             # ------------------------------------------------
             # RECARGAR SCRIPTS
             # ------------------------------------------------
+            self.report({'INFO'}, "Update installed — Reload Scripts")
             bpy.ops.script.reload()
 
             self.report({'INFO'}, "KustomTools updated")
