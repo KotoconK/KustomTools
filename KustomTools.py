@@ -2,7 +2,7 @@
 bl_info = {
     "name": "KustomTools",
     "author": "Álvaro_A",
-    "version": (1, 2, 3),
+    "version": (1, 3, 0),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Kustom Tools",
     "description": "Orient Cursor tools and basic color settings to improve experience",
@@ -211,6 +211,43 @@ def activate_edit_cursor_mode(context):
 
     set_status(context, "Edit Cursor mode enabled")
 
+def activate_edit_pivot_mode(context):
+
+    scene = context.scene
+    ts = scene.tool_settings
+
+    try:
+        bpy.ops.wm.tool_set_by_id(
+            name="builtin.transform"
+        )
+    except:
+        pass
+
+    try:
+        scene.transform_orientation_slots[0].type = 'LOCAL'
+    except:
+        pass
+
+    try:
+        ts.use_transform_data_origin = True
+    except:
+        pass
+
+    try:
+        ts.use_snap = True
+        ts.snap_elements = {
+            'VERTEX',
+            'EDGE_MIDPOINT',
+            'FACE'
+        }
+        ts.snap_target = 'CENTER'
+    except:
+        pass
+
+    set_status(
+        context,
+        "Edit Pivot enabled | Alt+Shift+MMB"
+    )
 
 def activate_use_cursor_mode(context):
     ts = context.scene.tool_settings
@@ -356,7 +393,39 @@ class VIEW3D_OT_cursor_orient_to_face_under_mouse(bpy.types.Operator):
 
         return {'FINISHED'}
 
+class VIEW3D_OT_alt_shift_mmb_dispatch(
+    bpy.types.Operator
+):
+    bl_idname = "view3d.alt_shift_mmb_dispatch"
+    bl_label = "Alt Shift MMB"
 
+    def invoke(
+        self,
+        context,
+        event
+    ):
+
+        if (
+            context.mode == 'OBJECT'
+            and
+            context.scene.edit_pivot_enabled
+        ):
+
+            return bpy.ops.view3d.edit_pivot_raycast(
+                'INVOKE_DEFAULT'
+            )
+
+        if (
+            context.mode == 'EDIT_MESH'
+            and
+            context.scene.cursor_align_enabled
+        ):
+
+            return bpy.ops.view3d.cursor_orient_to_face_under_mouse(
+                'INVOKE_DEFAULT'
+            )
+
+        return {'CANCELLED'}
 class VIEW3D_OT_cursor_align_apply_setup(bpy.types.Operator):
     bl_idname = "view3d.cursor_align_apply_setup"
     bl_label = "◎ Use Origin"
@@ -485,6 +554,127 @@ class VIEW3D_OT_cursor_to_selected(bpy.types.Operator):
             self.report({'WARNING'}, str(e))
 
         return {'FINISHED'}
+ 
+
+class VIEW3D_OT_edit_pivot(bpy.types.Operator):
+    bl_idname = "view3d.edit_pivot"
+    bl_label = "Edit Pivot"
+
+    def execute(self, context):
+
+        scene = context.scene
+        ts = scene.tool_settings
+
+        if scene.edit_pivot_enabled:
+
+            scene.edit_pivot_enabled = False
+            
+            if not context.scene.cursor_align_enabled:
+                unregister_keymaps()
+
+            ts.use_transform_data_origin = False
+
+            reset_transform_mode(context)
+
+            self.report(
+                {'INFO'},
+                "Edit Pivot OFF"
+            )
+
+        else:
+
+            scene.edit_pivot_enabled = True
+            scene.cursor_align_enabled = False
+            register_keymaps()
+
+            activate_edit_pivot_mode(
+                context
+            )
+
+            self.report(
+                {'INFO'},
+                "Edit Pivot ON"
+            )
+
+        return {'FINISHED'}
+    
+class VIEW3D_OT_edit_pivot_raycast(bpy.types.Operator):
+    bl_idname = "view3d.edit_pivot_raycast"
+    bl_label = "Edit Pivot Raycast"
+
+    @classmethod
+    def poll(cls, context):
+
+        return (
+            context.area is not None
+            and context.area.type == 'VIEW_3D'
+            and context.mode == 'OBJECT'
+            and context.active_object is not None
+            and context.active_object.type == 'MESH'
+        )
+
+    def invoke(self, context, event):
+        if not context.scene.edit_pivot_enabled:
+            return {'CANCELLED'}
+        region = context.region
+        rv3d = context.space_data.region_3d
+
+        mouse_co = (
+            event.mouse_region_x,
+            event.mouse_region_y
+        )
+
+        ray_origin = view3d_utils.region_2d_to_origin_3d(
+            region,
+            rv3d,
+            mouse_co
+        )
+
+        ray_dir = view3d_utils.region_2d_to_vector_3d(
+            region,
+            rv3d,
+            mouse_co
+        )
+
+        hit, location, normal, face_index, obj, matrix = (
+            context.scene.ray_cast(
+                context.evaluated_depsgraph_get(),
+                ray_origin,
+                ray_dir
+            )
+        )
+
+        if not hit:
+            self.report({'WARNING'}, "No face detected")
+            return {'CANCELLED'}
+
+        print("NORMAL =", normal)
+
+        quat = normal.to_track_quat('Z', 'Y')
+        mat = quat.to_matrix()
+
+        slot = context.scene.transform_orientation_slots[0]
+
+        try:
+            bpy.ops.transform.create_orientation(
+                name="EditPivotFace",
+                use=True,
+                overwrite=True
+            )
+        except:
+            pass
+
+        slot = context.scene.transform_orientation_slots[0]
+
+        if slot.custom_orientation:
+            slot.custom_orientation.matrix = mat
+
+        slot.type = 'EditPivotFace'
+
+        print("NORMAL =", normal)
+        print("MATRIX =", mat)
+
+        return {'FINISHED'}
     
 class KT_OT_update_addon(bpy.types.Operator):
     bl_idname = "kt.update_addon"
@@ -545,7 +735,7 @@ def register_keymaps():
 
     km = kc.keymaps.new(name="3D View", space_type='VIEW_3D')
     kmi = km.keymap_items.new(
-        VIEW3D_OT_cursor_orient_to_face_under_mouse.bl_idname,
+        VIEW3D_OT_alt_shift_mmb_dispatch.bl_idname,
         type='MIDDLEMOUSE',
         value='PRESS',
         alt=True,
@@ -555,12 +745,23 @@ def register_keymaps():
 
 
 def update_enabled(self, context):
+
     if context.scene.cursor_align_enabled:
+
+        context.scene.edit_pivot_enabled = False
+
         apply_user_setup(context)
         register_keymaps()
-        set_status(context, "Use Alt+Shift+MMB to align cursor to face")
+        set_status(
+            context,
+            "Use Alt+Shift+MMB to align cursor to face"
+        )
+
     else:
-        unregister_keymaps()
+
+        if not context.scene.edit_pivot_enabled:
+            unregister_keymaps()
+
         set_status(context, "Disabled")
 
 
@@ -582,11 +783,42 @@ class VIEW3D_PT_cursor_align_sidebar(bpy.types.Panel):
         col = layout.column(align=True)
 
         # ------------------------------------------------------------
-        # ON
+        # EDIT PIVOT
         # ------------------------------------------------------------
+
         row = col.row()
         row.scale_y = 1.3
-        row.prop(scene, "cursor_align_enabled", text="Copy cursor rot", toggle=True, icon='ORIENTATION_CURSOR')
+
+        row.enabled = (context.mode == 'OBJECT')
+
+        sub = row.row()
+        sub.alert = scene.edit_pivot_enabled
+
+        sub.operator(
+            "view3d.edit_pivot",
+            text="Edit Pivot",
+            icon='PIVOT_INDIVIDUAL'
+        )
+
+        # ------------------------------------------------------------
+        # COPY CURSOR ROT
+        # ------------------------------------------------------------
+
+        row = col.row()
+        row.scale_y = 1.3
+
+        row.enabled = (context.mode == 'EDIT_MESH')
+
+        sub = row.row()
+        sub.alert = scene.cursor_align_enabled
+
+        sub.prop(
+            scene,
+            "cursor_align_enabled",
+            text="Copy Cursor Rot",
+            toggle=True,
+            icon='ORIENTATION_CURSOR'
+        )
 
         # ------------------------------------------------------------
         # USE ORIGIN / RESET
@@ -678,105 +910,236 @@ class VIEW3D_PT_info_panel(bpy.types.Panel):
 
         layout = self.layout
         col = layout.column(align=True)
-
-        # ------------------------------------------------------------
-        # UPDATER
-        # ------------------------------------------------------------
-        col.separator()
-
         version_str = ".".join(map(str, ADDON_VERSION))
 
-        col.label(
-            text=f"Version {version_str}",
+        # ------------------------------------------------------------
+        # VERSION / UPDATE
+        # ------------------------------------------------------------
+
+        box = col.box()
+
+        row = box.row()
+        row.label(
+            text=f"KUSTOMTOOLS {version_str}",
             icon='BLENDER'
         )
-        col.separator()
 
-        col.operator(
+        box.separator(factor=0.3)
+
+        box.operator(
             "kt.update_addon",
             text="Check Update",
             icon='IMPORT'
         )
-        # ------------------------------------------------------------
-        # SHORTCUT
-        # ------------------------------------------------------------
-        col.separator()
-        col.label(text="Shortcut", icon='MOUSE_MMB')
-        col.label(text="Alt + Shift + MMB")
 
         # ------------------------------------------------------------
-        # EDIT CURSOR
+        # GLOBAL SHORTCUT
         # ------------------------------------------------------------
-        col.separator()
-        col.label(text="Edit Cursor", icon='CURSOR')
-        col.label(text="Tool: 3D Cursor")
-        col.label(text="Snap: Vertex")
-        col.label(text="Target: Closest")
+
+        box = col.box()
+
+        row = box.row()
+        row.label(
+            text="GLOBAL SHORTCUT",
+            icon='MOUSE_MMB'
+        )
+
+        box.separator(factor=0.3)
+
+        col2 = box.column(align=True)
+
+        col2.label(text="Alt + Shift + MMB")
+        col2.label(text="Context sensitive")
 
         # ------------------------------------------------------------
-        # USE ORIGIN
+        # TOOLS
         # ------------------------------------------------------------
-        col.separator()
-        col.label(text="Use Origin", icon='OBJECT_ORIGIN')
-        col.label(text="Tool: Transform")
-        col.label(text="Orientation: Cursor")
-        col.label(text="Pivot: Active Element")
 
-        # ------------------------------------------------------------
-        # USE CURSOR
-        # ------------------------------------------------------------
-        col.separator()
-        col.label(text="Use Cursor", icon='PIVOT_CURSOR')
-        col.label(text="Tool: Transform")
-        col.label(text="Pivot: 3D Cursor")
-        col.label(text="Snap: OFF")
+        box = col.box()
+
+        row = box.row()
+        row.label(
+            text="TOOLS",
+            icon='TOOL_SETTINGS'
+        )
+
+        box.separator(factor=0.3)
+
+        col2 = box.column(align=True)
+
+        col2.label(
+            text="EDIT PIVOT",
+            icon='PIVOT_INDIVIDUAL'
+        )
+        col2.label(text="Object Mode")
+        col2.label(text="Affect Only Origins")
+        col2.label(text="Snap: Vertex / Edge / Face")
+        col2.label(text="Alt+Shift+MMB → Face Align")
+
+        box.separator()
+
+        col2 = box.column(align=True)
+
+        col2.label(
+            text="COPY CURSOR ROT",
+            icon='ORIENTATION_CURSOR'
+        )
+        col2.label(text="Edit Mode")
+        col2.label(text="Orient Cursor from Face")
+        col2.label(text="Alt+Shift+MMB → Face Align")
+
+        box.separator()
+
+        col2 = box.column(align=True)
+
+        col2.label(
+            text="EDIT CURSOR",
+            icon='CURSOR'
+        )
+        col2.label(text="Tool: 3D Cursor")
+        col2.label(text="Snap: Vertex")
+        col2.label(text="Target: Closest")
 
         # ------------------------------------------------------------
         # ORIGIN TOOLS
         # ------------------------------------------------------------
-        col.separator()
-        col.label(text="Origin to Geo", icon='OBJECT_ORIGIN')
-        col.label(text="Set origin to geometry")
 
-        col.separator()
-        col.label(text="Origin to Cursor", icon='CURSOR')
-        col.label(text="Set origin to 3D Cursor")
+        box = col.box()
+
+        row = box.row()
+        row.label(
+            text="ORIGIN TOOLS",
+            icon='OBJECT_ORIGIN'
+        )
+
+        box.separator(factor=0.3)
+
+        col2 = box.column(align=True)
+
+        col2.label(
+            text="USE ORIGIN",
+            icon='OBJECT_ORIGIN'
+        )
+        col2.label(text="Tool: Transform")
+        col2.label(text="Orientation: Cursor")
+        col2.label(text="Pivot: Active Element")
+
+        box.separator()
+
+        col2 = box.column(align=True)
+
+        col2.label(
+            text="ORIGIN TO GEOMETRY",
+            icon='MESH_CUBE'
+        )
+        col2.label(text="Set origin to geometry")
+
+        box.separator()
+
+        col2 = box.column(align=True)
+
+        col2.label(
+            text="ORIGIN TO CURSOR",
+            icon='CURSOR'
+        )
+        col2.label(text="Set origin to 3D Cursor")
+
+        box.separator()
+
+        col2 = box.column(align=True)
+
+        col2.label(
+            text="SNAP POINT",
+            icon='SNAP_VERTEX'
+        )
+        col2.label(text="Origin → Cursor")
+        col2.label(text="Snap: Vertex")
+        col2.label(text="Target: Center")
+        col2.label(text="Orientation: Local")
 
         # ------------------------------------------------------------
-        # SNAP POINT
+        # CURSOR TOOLS
         # ------------------------------------------------------------
-        col.separator()
-        col.label(text="Snap Point", icon='SNAP_VERTEX')
-        col.label(text="Snap: Vertex")
-        col.label(text="Target: Center")
-        col.label(text="Orientation: Local")
 
-        # ------------------------------------------------------------
-        # SELECTION / CURSOR
-        # ------------------------------------------------------------
-        col.separator()
-        col.label(text="Geo to Cursor", icon='MESH_CUBE')
-        col.label(text="Move selection to Cursor")
+        box = col.box()
 
-        col.separator()
-        col.label(text="Cursor to Selected", icon='CURSOR')
-        col.label(text="Move Cursor to selection")
+        row = box.row()
+        row.label(
+            text="CURSOR TOOLS",
+            icon='CURSOR'
+        )
+
+        box.separator(factor=0.3)
+
+        col2 = box.column(align=True)
+
+        col2.label(
+            text="USE CURSOR",
+            icon='PIVOT_CURSOR'
+        )
+        col2.label(text="Tool: Transform")
+        col2.label(text="Pivot: 3D Cursor")
+        col2.label(text="Snap: OFF")
+
+        box.separator()
+
+        col2 = box.column(align=True)
+
+        col2.label(
+            text="SELECTION TO CURSOR",
+            icon='MESH_CUBE'
+        )
+        col2.label(text="Move selection to Cursor")
+
+        box.separator()
+
+        col2 = box.column(align=True)
+
+        col2.label(
+            text="CURSOR TO SELECTED",
+            icon='CURSOR'
+        )
+        col2.label(text="Move Cursor to selection")
 
         # ------------------------------------------------------------
         # RESET
         # ------------------------------------------------------------
-        col.separator()
-        col.label(text="Reset", icon='LOOP_BACK')
-        col.label(text="Tool: Transform")
-        col.label(text="Orientation: Normal")
-        col.label(text="Pivot: Active Element")
-        col.label(text="Snap: OFF")
+
+        box = col.box()
+
+        row = box.row()
+        row.label(
+            text="RESET",
+            icon='LOOP_BACK'
+        )
+
+        box.separator(factor=0.3)
+
+        col2 = box.column(align=True)
+
+        col2.label(text="Tool: Transform")
+        col2.label(text="Orientation: Normal")
+        col2.label(text="Pivot: Active Element")
+        col2.label(text="Snap: OFF")
+        col2.label(text="Origins: OFF")
 
         # ------------------------------------------------------------
         # AUTHOR
         # ------------------------------------------------------------
-        col.separator()
-        col.label(text="Developed by Álvaro_A", icon='INFO')
+
+        box = col.box()
+
+        row = box.row()
+        row.label(
+            text="AUTHOR",
+            icon='INFO'
+        )
+
+        box.separator(factor=0.3)
+
+        col2 = box.column(align=True)
+
+        col2.label(text="Developed by Álvaro_A")
 
 # ------------------------------------------------------------
 # Register
@@ -784,8 +1147,11 @@ class VIEW3D_PT_info_panel(bpy.types.Panel):
 
 classes = (
     VIEW3D_OT_cursor_orient_to_face_under_mouse,
+    VIEW3D_OT_alt_shift_mmb_dispatch,
     VIEW3D_OT_cursor_align_apply_setup,
     VIEW3D_OT_cursor_align_edit_cursor,
+    VIEW3D_OT_edit_pivot,
+    VIEW3D_OT_edit_pivot_raycast,
     VIEW3D_OT_cursor_align_use_cursor,
     VIEW3D_OT_cursor_align_reset,
     VIEW3D_OT_cursor_align_snap_mid,
@@ -846,6 +1212,11 @@ def register():
         default=False
     )
     
+    bpy.types.Scene.edit_pivot_enabled = bpy.props.BoolProperty(
+        name="Edit Pivot",
+        default=False,
+    )
+    
     if viewport_mode_handler not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(viewport_mode_handler)
 
@@ -860,6 +1231,9 @@ def unregister():
 
     if hasattr(bpy.types.Scene, "cursor_align_info_expanded"):
         del bpy.types.Scene.cursor_align_info_expanded
+        
+    if hasattr(bpy.types.Scene, "edit_pivot_enabled"):
+        del bpy.types.Scene.edit_pivot_enabled
 
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
