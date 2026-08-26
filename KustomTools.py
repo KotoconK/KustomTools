@@ -2,7 +2,7 @@
 bl_info = {
     "name": "KustomTools",
     "author": "Álvaro_A",
-    "version": (1, 3, 0),
+    "version": (1, 4, 1),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Kustom Tools",
     "description": "Orient Cursor tools and basic color settings to improve experience",
@@ -23,61 +23,82 @@ addon_keymaps = []
 # VIEWPORT TOOLS
 # ------------------------------------------------------------
 
-def update_viewport_background():
-    obj = bpy.context.object
-    scene = bpy.context.scene
+def apply_viewport_background(scene):
+    """Apply the custom background in Edit Mode and restore the theme outside it."""
 
-    if not obj:
+    obj = bpy.context.object
+    is_edit_mode = obj is not None and obj.mode == 'EDIT'
+    enabled = getattr(scene, "ct_bg_enabled", False)
+    color = getattr(scene, "ct_edit_bg_color", (0.05, 0.05, 0.05))
+
+    wm = bpy.context.window_manager
+    if wm is None:
         return
 
-    for window in bpy.context.window_manager.windows:
-        for area in window.screen.areas:
-            if area.type == 'VIEW_3D':
-                space = area.spaces.active
+    for window in wm.windows:
+        screen = window.screen
+        if screen is None:
+            continue
+
+        for area in screen.areas:
+            if area.type != 'VIEW_3D':
+                continue
+
+            for space in area.spaces:
+                if space.type != 'VIEW_3D':
+                    continue
+
                 shading = space.shading
 
-                if obj.mode == 'EDIT':
+                if enabled and is_edit_mode:
                     shading.background_type = 'VIEWPORT'
-                    shading.background_color = scene.ct_edit_bg_color
+                    shading.background_color = color
                 else:
                     shading.background_type = 'THEME'
-                    
-def viewport_mode_handler(scene):
-    if not scene.ct_bg_enabled:
+
+            area.tag_redraw()
+
+
+def update_viewport_background(self=None, context=None):
+    """Property callback: refresh the viewport when the background color changes."""
+
+    scene = None
+
+    if context is not None:
+        scene = context.scene
+    elif isinstance(self, bpy.types.Scene):
+        scene = self
+    else:
+        scene = getattr(bpy.context, "scene", None)
+
+    if scene is not None:
+        apply_viewport_background(scene)
+
+
+def viewport_mode_handler(scene, depsgraph=None):
+    """Refresh the background after depsgraph updates, including mode changes."""
+
+    if not hasattr(scene, "ct_bg_enabled"):
         return
 
-    obj = bpy.context.object
-    if not obj:
-        return
+    apply_viewport_background(scene)
 
-    color = scene.ct_edit_bg_color
-
-    for window in bpy.context.window_manager.windows:
-        for area in window.screen.areas:
-            if area.type == 'VIEW_3D':
-                for space in area.spaces:
-                    if space.type == 'VIEW_3D':
-                        shading = space.shading
-
-                        if obj.mode == 'EDIT':
-                            shading.background_type = 'VIEWPORT'
-                            shading.background_color = color
-                        else:
-                            shading.background_type = 'THEME'
-                            
 
 class CT_OT_enable_dynamic_bg(bpy.types.Operator):
     bl_idname = "ct.enable_dynamic_bg"
-    bl_label = "Apply Edit Background"
+    bl_label = "Toggle Edit Background"
+    bl_description = "Enable or disable the custom viewport background while in Edit Mode"
 
     def execute(self, context):
+        scene = context.scene
+        scene.ct_bg_enabled = not scene.ct_bg_enabled
 
-        context.scene.ct_bg_enabled = True
+        apply_viewport_background(scene)
 
-        # 🔹 Forzar actualización inmediata
-        viewport_mode_handler(context.scene)
-
-        self.report({'INFO'}, "Edit Mode background enabled")
+        if scene.ct_bg_enabled:
+            self.report({'INFO'}, "Edit Mode background enabled")
+        else:
+            self.report({'INFO'}, "Edit Mode background disabled")
 
         return {'FINISHED'}
 
@@ -712,6 +733,130 @@ class KT_OT_update_addon(bpy.types.Operator):
             self.report({'ERROR'}, str(e))
 
         return {'FINISHED'}
+
+# ------------------------------------------------------------
+# MATERIAL TOOLS
+# ------------------------------------------------------------
+
+class KT_OT_delete_unused_materials(bpy.types.Operator):
+    bl_idname = "kt.delete_unused_materials"
+    bl_label = "Delete Unused Materials"
+    bl_description = "Delete all materials with zero users"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        unused_materials = [mat for mat in bpy.data.materials if mat.users == 0]
+
+        for mat in unused_materials:
+            bpy.data.materials.remove(mat)
+
+        count = len(unused_materials)
+
+        if context.scene.kt_material_name and context.scene.kt_material_name not in bpy.data.materials:
+            context.scene.kt_material_name = ""
+
+        self.report({'INFO'}, f"Deleted {count} unused material{'s' if count != 1 else ''}")
+        return {'FINISHED'}
+
+
+class KT_OT_select_by_material(bpy.types.Operator):
+    bl_idname = "kt.select_by_material"
+    bl_label = "Select by Material"
+    bl_description = "Select objects in Object Mode or faces in Edit Mode that use the chosen material"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        material_name = context.scene.kt_material_name.strip()
+        material = bpy.data.materials.get(material_name)
+
+        if material is None:
+            self.report({'WARNING'}, "Choose a valid material first")
+            return {'CANCELLED'}
+
+        # --------------------------------------------------------
+        # OBJECT MODE: select every mesh object using the material
+        # --------------------------------------------------------
+        if context.mode == 'OBJECT':
+            bpy.ops.object.select_all(action='DESELECT')
+
+            first_obj = None
+            selected_count = 0
+
+            for obj in context.view_layer.objects:
+                if obj.type != 'MESH':
+                    continue
+
+                uses_material = any(
+                    slot.material == material
+                    for slot in obj.material_slots
+                )
+
+                if uses_material:
+                    obj.select_set(True)
+                    selected_count += 1
+
+                    if first_obj is None:
+                        first_obj = obj
+
+            if first_obj is not None:
+                context.view_layer.objects.active = first_obj
+
+            self.report(
+                {'INFO'},
+                f"Selected {selected_count} object{'s' if selected_count != 1 else ''} using {material.name}"
+            )
+            return {'FINISHED'}
+
+        # --------------------------------------------------------
+        # EDIT MODE: select every face using the material
+        # Supports multi-object Edit Mode.
+        # --------------------------------------------------------
+        if context.mode == 'EDIT_MESH':
+            context.tool_settings.mesh_select_mode = (False, False, True)
+
+            selected_faces = 0
+            edit_objects = [
+                obj for obj in context.objects_in_mode_unique_data
+                if obj.type == 'MESH'
+            ]
+
+            for obj in edit_objects:
+                bm = bmesh.from_edit_mesh(obj.data)
+                bm.faces.ensure_lookup_table()
+
+                # Clear current face selection first.
+                for face in bm.faces:
+                    face.select = False
+
+                for face in bm.faces:
+                    slot_index = face.material_index
+
+                    if slot_index >= len(obj.material_slots):
+                        continue
+
+                    slot = obj.material_slots[slot_index]
+
+                    if slot.material == material:
+                        face.select = True
+                        selected_faces += 1
+
+                bm.select_mode = {'FACE'}
+                bm.select_flush_mode()
+                bmesh.update_edit_mesh(
+                    obj.data,
+                    loop_triangles=False,
+                    destructive=False
+                )
+
+            self.report(
+                {'INFO'},
+                f"Selected {selected_faces} face{'s' if selected_faces != 1 else ''} using {material.name}"
+            )
+            return {'FINISHED'}
+
+        self.report({'WARNING'}, "Use this tool in Object Mode or Mesh Edit Mode")
+        return {'CANCELLED'}
+
 # ------------------------------------------------------------
 # Keymap
 # ------------------------------------------------------------
@@ -881,7 +1026,7 @@ class VIEW3D_PT_viewport_tools(bpy.types.Panel):
         row.operator(
             "ct.enable_dynamic_bg",
             text="",
-            icon='PLAY'
+            icon='CHECKMARK' if scene.ct_bg_enabled else 'PLAY'
         )
 
         # 🎨 Active Object Color
@@ -896,6 +1041,56 @@ class VIEW3D_PT_viewport_tools(bpy.types.Panel):
             "ct.set_active_object_color",
             text="",
             icon='PLAY'
+        )
+
+
+class VIEW3D_PT_material_tools(bpy.types.Panel):
+    bl_label = "Material Tools"
+    bl_idname = "VIEW3D_PT_material_tools"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "KustomTools"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        scene = context.scene
+
+        col = layout.column(align=True)
+
+        # Material selector and contextual selection button
+        box = col.box()
+        box.label(text="Select by Material", icon='MATERIAL')
+        box.prop_search(
+            scene,
+            "kt_material_name",
+            bpy.data,
+            "materials",
+            text="Material"
+        )
+
+        if context.mode == 'EDIT_MESH':
+            button_text = "Select Faces"
+            button_icon = 'FACESEL'
+        else:
+            button_text = "Select Objects"
+            button_icon = 'RESTRICT_SELECT_OFF'
+
+        row = box.row(align=True)
+        row.enabled = context.mode in {'OBJECT', 'EDIT_MESH'}
+        row.operator(
+            "kt.select_by_material",
+            text=button_text,
+            icon=button_icon
+        )
+
+        # Unused material cleanup
+        box = col.box()
+        box.label(text="Cleanup", icon='BRUSH_DATA')
+        box.operator(
+            "kt.delete_unused_materials",
+            text="Delete Unused Materials",
+            icon='TRASH'
         )
 
 class VIEW3D_PT_info_panel(bpy.types.Panel):
@@ -1158,12 +1353,15 @@ classes = (
     VIEW3D_OT_cursor_align_origin_to_geometry, 
     VIEW3D_PT_cursor_align_sidebar,
     VIEW3D_PT_viewport_tools,
+    VIEW3D_PT_material_tools,
     VIEW3D_OT_cursor_align_origin_to_cursor,
     VIEW3D_OT_selection_to_cursor,
     VIEW3D_OT_cursor_to_selected,
     VIEW3D_PT_info_panel,
     CT_OT_enable_dynamic_bg,
     CT_OT_set_active_object_color,
+    KT_OT_delete_unused_materials,
+    KT_OT_select_by_material,
     KT_OT_update_addon,
 )
 
@@ -1195,7 +1393,8 @@ def register():
         size=3,
         min=0.0,
         max=1.0,
-        default=hex_to_linear_rgb("#2B331B")
+        default=hex_to_linear_rgb("#2B331B"),
+        update=update_viewport_background,
     )
 
     bpy.types.Scene.ct_active_obj_color = bpy.props.FloatVectorProperty(
@@ -1216,6 +1415,12 @@ def register():
         name="Edit Pivot",
         default=False,
     )
+
+    bpy.types.Scene.kt_material_name = bpy.props.StringProperty(
+        name="Material",
+        description="Material used by Material Tools",
+        default="",
+    )
     
     if viewport_mode_handler not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(viewport_mode_handler)
@@ -1234,6 +1439,9 @@ def unregister():
         
     if hasattr(bpy.types.Scene, "edit_pivot_enabled"):
         del bpy.types.Scene.edit_pivot_enabled
+
+    if hasattr(bpy.types.Scene, "kt_material_name"):
+        del bpy.types.Scene.kt_material_name
 
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
