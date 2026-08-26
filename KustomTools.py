@@ -2,7 +2,7 @@
 bl_info = {
     "name": "KustomTools",
     "author": "Álvaro_A",
-    "version": (1, 4, 1),
+    "version": (1, 4, 2),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Kustom Tools",
     "description": "Orient Cursor tools and basic color settings to improve experience",
@@ -738,24 +738,67 @@ class KT_OT_update_addon(bpy.types.Operator):
 # MATERIAL TOOLS
 # ------------------------------------------------------------
 
+def get_materials_used_by_scene_objects():
+    """Return materials assigned to objects that are actually linked to a scene.
+
+    This intentionally ignores references coming only from orphaned mesh/object
+    datablocks. Blender's recursive Unused Data cleanup removes those orphaned
+    datablocks first, which is why their materials can disappear there even when
+    material.users is greater than zero.
+    """
+    used_materials = set()
+
+    for scene in bpy.data.scenes:
+        for obj in scene.objects:
+            for slot in obj.material_slots:
+                if slot.material is not None:
+                    used_materials.add(slot.material)
+
+    return used_materials
+
+
 class KT_OT_delete_unused_materials(bpy.types.Operator):
     bl_idname = "kt.delete_unused_materials"
     bl_label = "Delete Unused Materials"
-    bl_description = "Delete all materials with zero users"
+    bl_description = (
+        "Delete materials not assigned to any object in any scene, including "
+        "materials kept alive only by orphaned datablocks"
+    )
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        unused_materials = [mat for mat in bpy.data.materials if mat.users == 0]
+        used_materials = get_materials_used_by_scene_objects()
+        unused_materials = [
+            mat for mat in bpy.data.materials
+            if mat not in used_materials and not mat.use_fake_user
+        ]
+
+        deleted_names = []
 
         for mat in unused_materials:
-            bpy.data.materials.remove(mat)
+            deleted_names.append(mat.name)
+            # do_unlink=True is important here: an orphaned Mesh datablock can
+            # still count as a material user even though no scene object uses it.
+            bpy.data.materials.remove(mat, do_unlink=True)
 
-        count = len(unused_materials)
+        count = len(deleted_names)
 
-        if context.scene.kt_material_name and context.scene.kt_material_name not in bpy.data.materials:
+        if (
+            context.scene.kt_material_name
+            and bpy.data.materials.get(context.scene.kt_material_name) is None
+        ):
             context.scene.kt_material_name = ""
 
-        self.report({'INFO'}, f"Deleted {count} unused material{'s' if count != 1 else ''}")
+        self.report(
+            {'INFO'},
+            f"Deleted {count} unused material{'s' if count != 1 else ''}"
+        )
+
+        if deleted_names:
+            print("KustomTools - Deleted unused materials:")
+            for name in deleted_names:
+                print(f"  - {name}")
+
         return {'FINISHED'}
 
 
