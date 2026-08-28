@@ -2,7 +2,7 @@
 bl_info = {
     "name": "KustomTools",
     "author": "Álvaro_A",
-    "version": (1, 4, 2),
+    "version": (1, 5, 0),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Kustom Tools",
     "description": "Orient Cursor tools and basic color settings to improve experience",
@@ -13,6 +13,7 @@ import bpy
 import bmesh
 import urllib.request
 import os
+from mathutils import Vector
 from mathutils.bvhtree import BVHTree
 from bpy_extras import view3d_utils
 
@@ -900,6 +901,241 @@ class KT_OT_select_by_material(bpy.types.Operator):
         self.report({'WARNING'}, "Use this tool in Object Mode or Mesh Edit Mode")
         return {'CANCELLED'}
 
+
+# ------------------------------------------------------------
+# MODELING TOOLS
+# ------------------------------------------------------------
+
+def kt_get_side_counts(edge_count):
+    """Distribute all loop edges across four sides as evenly as possible."""
+    base = edge_count // 4
+    remainder = edge_count % 4
+
+    if remainder == 0:
+        return [base, base, base, base]
+    if remainder == 1:
+        return [base + 1, base, base, base]
+    if remainder == 2:
+        # Keep the two extra edges on opposite sides.
+        return [base + 1, base, base + 1, base]
+
+    return [base + 1, base + 1, base + 1, base]
+
+
+def kt_get_ordered_edge_loop(selected_edges):
+    """Return vertices ordered around one closed selected edge loop."""
+    adjacency = {}
+
+    for edge in selected_edges:
+        v1, v2 = edge.verts
+        adjacency.setdefault(v1, []).append(v2)
+        adjacency.setdefault(v2, []).append(v1)
+
+    if not adjacency:
+        raise RuntimeError("Select a closed edge loop")
+
+    for vert, neighbours in adjacency.items():
+        if len(neighbours) != 2:
+            raise RuntimeError(
+                "Selection must be one closed edge loop; every selected vertex "
+                "must have exactly two selected neighbours"
+            )
+
+    start = next(iter(adjacency))
+    ordered = [start]
+    previous = None
+    current = start
+
+    while True:
+        neighbours = adjacency[current]
+        next_vert = neighbours[0] if neighbours[0] != previous else neighbours[1]
+
+        if next_vert == start:
+            break
+
+        ordered.append(next_vert)
+        previous = current
+        current = next_vert
+
+        if len(ordered) > len(adjacency):
+            raise RuntimeError("Could not resolve the selected edge loop")
+
+    if len(ordered) != len(adjacency):
+        raise RuntimeError("Selection contains more than one edge loop")
+
+    return ordered
+
+
+def kt_detect_axis_plane(world_positions):
+    """Detect XY, XZ or YZ from the smallest world-space bounding-box range."""
+    ranges = []
+
+    for axis in range(3):
+        values = [pos[axis] for pos in world_positions]
+        ranges.append(max(values) - min(values))
+
+    normal_axis = ranges.index(min(ranges))
+    plane_axes = [axis for axis in range(3) if axis != normal_axis]
+
+    return normal_axis, plane_axes[0], plane_axes[1]
+
+
+def kt_rotate_list(values, offset):
+    return values[offset:] + values[:offset]
+
+
+class KT_OT_quadrangulate_loop(bpy.types.Operator):
+    bl_idname = "kt.quadrangulate_loop"
+    bl_label = "Quadrangulate Loop"
+    bl_description = (
+        "Reshape one selected closed edge loop into an axis-aligned square, "
+        "keeping all vertices and distributing extra edges across the four sides"
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.edit_object
+        return (
+            context.mode == 'EDIT_MESH'
+            and obj is not None
+            and obj.type == 'MESH'
+        )
+
+    def execute(self, context):
+        obj = context.edit_object
+        bm = bmesh.from_edit_mesh(obj.data)
+
+        bm.verts.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+
+        selected_edges = [edge for edge in bm.edges if edge.select]
+
+        if not selected_edges:
+            self.report({'WARNING'}, "Select one complete closed edge loop")
+            return {'CANCELLED'}
+
+        try:
+            vertices = kt_get_ordered_edge_loop(selected_edges)
+        except RuntimeError as error:
+            self.report({'WARNING'}, str(error))
+            return {'CANCELLED'}
+
+        vertex_count = len(vertices)
+
+        if vertex_count < 4:
+            self.report({'WARNING'}, "The loop needs at least 4 edges")
+            return {'CANCELLED'}
+
+        side_counts = kt_get_side_counts(vertex_count)
+
+        matrix_world = obj.matrix_world
+        matrix_world_inv = matrix_world.inverted()
+
+        def world_position(vert):
+            return matrix_world @ vert.co
+
+        positions = [world_position(vert) for vert in vertices]
+        normal_axis, axis_u, axis_v = kt_detect_axis_plane(positions)
+
+        center = Vector((0.0, 0.0, 0.0))
+        for pos in positions:
+            center += pos
+        center /= vertex_count
+
+        u_values = [pos[axis_u] for pos in positions]
+        v_values = [pos[axis_v] for pos in positions]
+
+        half_u = (max(u_values) - min(u_values)) * 0.5
+        half_v = (max(v_values) - min(v_values)) * 0.5
+
+        if half_u <= 1.0e-8 or half_v <= 1.0e-8:
+            self.report({'WARNING'}, "Selected loop is too flat or degenerate")
+            return {'CANCELLED'}
+
+        # Force a square while keeping approximately the original overall size.
+        half_size = (half_u + half_v) * 0.5
+        half_u = half_size
+        half_v = half_size
+
+        # Start from the existing vertex closest to the bottom-left corner
+        # of the detected axis plane. This avoids changing topology.
+        target_u = center[axis_u] - half_u
+        target_v = center[axis_v] - half_v
+
+        best_index = 0
+        best_distance = None
+
+        for index, pos in enumerate(positions):
+            du = pos[axis_u] - target_u
+            dv = pos[axis_v] - target_v
+            distance = du * du + dv * dv
+
+            if best_distance is None or distance < best_distance:
+                best_distance = distance
+                best_index = index
+
+        vertices = kt_rotate_list(vertices, best_index)
+
+        # From bottom-left, make the first side travel mainly toward +U.
+        if len(vertices) > 1:
+            p0 = world_position(vertices[0])
+            p1 = world_position(vertices[1])
+            du = p1[axis_u] - p0[axis_u]
+            dv = p1[axis_v] - p0[axis_v]
+
+            if abs(dv) > abs(du) or du < 0.0:
+                vertices = [vertices[0]] + list(reversed(vertices[1:]))
+
+        corners = [
+            (-half_u, -half_v),
+            ( half_u, -half_v),
+            ( half_u,  half_v),
+            (-half_u,  half_v),
+        ]
+
+        vertex_index = 0
+
+        for side in range(4):
+            edge_count = side_counts[side]
+            start_corner = corners[side]
+            end_corner = corners[(side + 1) % 4]
+
+            for local_index in range(edge_count):
+                vert = vertices[vertex_index]
+                t = float(local_index) / float(edge_count)
+
+                u = start_corner[0] + (end_corner[0] - start_corner[0]) * t
+                v = start_corner[1] + (end_corner[1] - start_corner[1]) * t
+
+                original_world = world_position(vert)
+                new_world = center.copy()
+
+                # Preserve the original coordinate perpendicular to the plane.
+                new_world[normal_axis] = original_world[normal_axis]
+                new_world[axis_u] = center[axis_u] + u
+                new_world[axis_v] = center[axis_v] + v
+
+                vert.co = matrix_world_inv @ new_world
+                vertex_index += 1
+
+        bmesh.update_edit_mesh(
+            obj.data,
+            loop_triangles=False,
+            destructive=False,
+        )
+
+        axis_names = ["X", "Y", "Z"]
+        plane_name = axis_names[axis_u] + axis_names[axis_v]
+        distribution = " / ".join(str(value) for value in side_counts)
+
+        self.report(
+            {'INFO'},
+            f"Quadrangulated {vertex_count} edges on {plane_name}: {distribution}"
+        )
+
+        return {'FINISHED'}
+
 # ------------------------------------------------------------
 # Keymap
 # ------------------------------------------------------------
@@ -1135,6 +1371,33 @@ class VIEW3D_PT_material_tools(bpy.types.Panel):
             text="Delete Unused Materials",
             icon='TRASH'
         )
+
+
+class VIEW3D_PT_modeling_tools(bpy.types.Panel):
+    bl_label = "Modeling Tools"
+    bl_idname = "VIEW3D_PT_modeling_tools"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "KustomTools"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        col = layout.column(align=True)
+
+        box = col.box()
+        box.label(text="Edge Loop", icon='MESH_GRID')
+
+        row = box.row(align=True)
+        row.enabled = context.mode == 'EDIT_MESH'
+        row.operator(
+            "kt.quadrangulate_loop",
+            text="Quadrangulate Loop",
+            icon='MESH_GRID'
+        )
+
+        if context.mode != 'EDIT_MESH':
+            box.label(text="Select a closed loop in Edit Mode", icon='INFO')
 
 class VIEW3D_PT_info_panel(bpy.types.Panel):
     bl_label = "Info"
@@ -1397,6 +1660,7 @@ classes = (
     VIEW3D_PT_cursor_align_sidebar,
     VIEW3D_PT_viewport_tools,
     VIEW3D_PT_material_tools,
+    VIEW3D_PT_modeling_tools,
     VIEW3D_OT_cursor_align_origin_to_cursor,
     VIEW3D_OT_selection_to_cursor,
     VIEW3D_OT_cursor_to_selected,
@@ -1405,6 +1669,7 @@ classes = (
     CT_OT_set_active_object_color,
     KT_OT_delete_unused_materials,
     KT_OT_select_by_material,
+    KT_OT_quadrangulate_loop,
     KT_OT_update_addon,
 )
 
