@@ -2,7 +2,7 @@
 bl_info = {
     "name": "KustomTools",
     "author": "Álvaro_A",
-    "version": (1, 7, 0),
+    "version": (1, 8, 0),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Kustom Tools",
     "description": "Orient Cursor tools and basic color settings to improve experience",
@@ -232,7 +232,7 @@ def activate_edit_cursor_mode(context):
     except Exception:
         pass
 
-    set_status(context, "Edit Cursor mode enabled")
+    set_status(context, "Edit 3D Cursor enabled | Alt+Shift+MMB aligns rotation")
 
 def activate_edit_pivot_mode(context):
 
@@ -461,19 +461,20 @@ class VIEW3D_OT_cursor_align_apply_setup(bpy.types.Operator):
         return {'FINISHED'}
 
 
-class VIEW3D_OT_cursor_align_edit_cursor(bpy.types.Operator):
-    bl_idname = "view3d.cursor_align_edit_cursor"
-    bl_label = "Edit Cursor"
+class VIEW3D_OT_reset_3d_cursor(bpy.types.Operator):
+    bl_idname = "view3d.reset_3d_cursor"
+    bl_label = "Reset 3D Cursor"
+    bl_description = "Reset 3D Cursor location and rotation to zero"
+    bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
+        cursor = context.scene.cursor
+        cursor.location = (0.0, 0.0, 0.0)
+        cursor.rotation_mode = 'XYZ'
+        cursor.rotation_euler = (0.0, 0.0, 0.0)
 
-        if is_edit_cursor_active(context):
-            reset_transform_mode(context)
-            self.report({'INFO'}, "Edit Cursor OFF")
-        else:
-            activate_edit_cursor_mode(context)
-            self.report({'INFO'}, "Edit Cursor ON")
-
+        set_status(context, "3D Cursor location and rotation reset")
+        self.report({'INFO'}, "3D Cursor reset")
         return {'FINISHED'}
 
 
@@ -488,14 +489,24 @@ class VIEW3D_OT_cursor_align_use_cursor(bpy.types.Operator):
         return {'FINISHED'}
 
 
-class VIEW3D_OT_cursor_align_reset(bpy.types.Operator):
-    bl_idname = "view3d.cursor_align_reset"
-    bl_label = "Reset"
-    bl_description = "Restore Transform tool, Normal orientation, Active Element pivot and Snap OFF"
+class VIEW3D_OT_cursor_align_use_selection(bpy.types.Operator):
+    bl_idname = "view3d.cursor_align_use_selection"
+    bl_label = "Use Selection"
+    bl_description = "Return to normal selection transforms: Transform tool, Normal orientation, Active Element pivot and Snap OFF"
 
     def execute(self, context):
+        scene = context.scene
+        scene.edit_pivot_enabled = False
+
+        if scene.cursor_align_enabled:
+            scene.cursor_align_enabled = False
+
+        scene.tool_settings.use_transform_data_origin = False
+        unregister_keymaps()
         reset_transform_mode(context)
-        self.report({'INFO'}, "Reset applied")
+        set_status(context, "Using Selection")
+
+        self.report({'INFO'}, "Use Selection enabled")
         return {'FINISHED'}
     
 
@@ -1463,22 +1474,25 @@ def register_keymaps():
 
 
 def update_enabled(self, context):
+    scene = context.scene
 
-    if context.scene.cursor_align_enabled:
+    if scene.cursor_align_enabled:
+        # Edit 3D Cursor combines the 3D Cursor editing setup with
+        # Alt+Shift+MMB rotation alignment.
+        scene.edit_pivot_enabled = False
+        scene.tool_settings.use_transform_data_origin = False
 
-        context.scene.edit_pivot_enabled = False
-
-        apply_user_setup(context)
+        activate_edit_cursor_mode(context)
         register_keymaps()
         set_status(
             context,
-            "Use Alt+Shift+MMB to align cursor to face"
+            "Edit 3D Cursor | Alt+Shift+MMB aligns rotation"
         )
 
     else:
-
-        if not context.scene.edit_pivot_enabled:
+        if not scene.edit_pivot_enabled:
             unregister_keymaps()
+            reset_transform_mode(context)
 
         set_status(context, "Disabled")
 
@@ -1501,75 +1515,78 @@ class VIEW3D_PT_cursor_align_sidebar(bpy.types.Panel):
         col = layout.column(align=True)
 
         # ------------------------------------------------------------
-        # EDIT PIVOT
+        # EDIT PIVOT + ORIGIN TO GEOMETRY
         # ------------------------------------------------------------
 
-        row = col.row()
+        row = col.row(align=True)
         row.scale_y = 1.3
-
         row.enabled = (context.mode == 'OBJECT')
 
-        sub = row.row()
+        sub = row.row(align=True)
         sub.alert = scene.edit_pivot_enabled
-
         sub.operator(
             "view3d.edit_pivot",
             text="Edit Pivot",
             icon='PIVOT_INDIVIDUAL'
         )
 
-        # ------------------------------------------------------------
-        # COPY CURSOR ROT
-        # ------------------------------------------------------------
-
-        row = col.row()
-        row.scale_y = 1.3
-
-        row.enabled = (context.mode == 'EDIT_MESH')
-
-        sub = row.row()
-        sub.alert = scene.cursor_align_enabled
-
-        sub.prop(
-            scene,
-            "cursor_align_enabled",
-            text="Copy Cursor Rot",
-            toggle=True,
-            icon='ORIENTATION_CURSOR'
-        )
-
-        # ------------------------------------------------------------
-        # USE ORIGIN / RESET
-        # ------------------------------------------------------------
-        col.separator()
-        
-        row = col.row(align=True)
-        sub = row.row(align=True)
-        sub.alert = is_edit_cursor_active(context)
-        sub.operator("view3d.cursor_align_edit_cursor", icon='CURSOR')
-        row.operator("view3d.cursor_align_reset", icon='LOOP_BACK')
-
-        # 👉 fila 
-        row = col.row(align=True)
-        row.operator("view3d.cursor_align_apply_setup")
-        row.operator("view3d.cursor_align_use_cursor")
-        
-        col.separator()
-
-        # Origin to Geometry - compact icon-only utility button.
-        row = col.row(align=True)
-        row.enabled = context.mode == 'OBJECT'
+        # Compact icon-only utility beside Edit Pivot.
         row.operator(
             "view3d.cursor_align_origin_to_geometry",
             text="",
             icon='GIZMO'
         )
+
+        # ------------------------------------------------------------
+        # EDIT 3D CURSOR
+        # ------------------------------------------------------------
+
+        row = col.row()
+        row.scale_y = 1.3
+        row.enabled = (context.mode == 'EDIT_MESH')
+
+        sub = row.row()
+        sub.alert = scene.cursor_align_enabled
+        sub.prop(
+            scene,
+            "cursor_align_enabled",
+            text="Edit 3D Cursor",
+            toggle=True,
+            icon='CURSOR'
+        )
+
+        # ------------------------------------------------------------
+        # RESET 3D CURSOR / USE SELECTION
+        # ------------------------------------------------------------
+
+        col.separator()
+
+        row = col.row(align=True)
+        row.operator(
+            "view3d.reset_3d_cursor",
+            text="Reset 3D Cursor",
+            icon='LOOP_BACK'
+        )
+        row.operator(
+            "view3d.cursor_align_use_selection",
+            text="Use Selection",
+            icon='FACESEL'
+        )
+
+        # ------------------------------------------------------------
+        # USE ORIGIN / USE CURSOR
+        # ------------------------------------------------------------
+
+        row = col.row(align=True)
+        row.operator("view3d.cursor_align_apply_setup")
+        row.operator("view3d.cursor_align_use_cursor")
+
         col.separator()
 
         status_box = col.box()
         status_box.label(text="Status", icon='INFO')
         status_box.label(text=scene.cursor_align_status)
-               
+
 class VIEW3D_PT_viewport_tools(bpy.types.Panel):
     bl_label = "Viewport Tools"
     bl_idname = "VIEW3D_PT_viewport_tools"
@@ -1710,12 +1727,8 @@ class VIEW3D_PT_modeling_tools(bpy.types.Panel):
 
     def draw(self, context):
         layout = self.layout
-        col = layout.column(align=True)
 
-        col.label(text="Edge Loop", icon='MESH_GRID')
-
-        box = col.box()
-        row = box.row(align=True)
+        row = layout.row(align=True)
         row.enabled = context.mode == 'EDIT_MESH'
         row.operator(
             "kt.quadrangulate_loop",
@@ -1812,24 +1825,13 @@ class VIEW3D_PT_info_panel(bpy.types.Panel):
         col2 = box.column(align=True)
 
         col2.label(
-            text="COPY CURSOR ROT",
-            icon='ORIENTATION_CURSOR'
-        )
-        col2.label(text="Edit Mode")
-        col2.label(text="Orient Cursor from Face")
-        col2.label(text="Alt+Shift+MMB → Face Align")
-
-        box.separator()
-
-        col2 = box.column(align=True)
-
-        col2.label(
-            text="EDIT CURSOR",
+            text="EDIT 3D CURSOR",
             icon='CURSOR'
         )
+        col2.label(text="Edit Mode")
         col2.label(text="Tool: 3D Cursor")
-        col2.label(text="Snap: Vertex")
-        col2.label(text="Target: Closest")
+        col2.label(text="Snap: Vertex / Closest")
+        col2.label(text="Alt+Shift+MMB → Face Align")
 
         # ------------------------------------------------------------
         # ORIGIN TOOLS
@@ -1890,26 +1892,35 @@ class VIEW3D_PT_info_panel(bpy.types.Panel):
         col2.label(text="Snap: OFF")
 
         # ------------------------------------------------------------
-        # RESET
+        # USE SELECTION / RESET 3D CURSOR
         # ------------------------------------------------------------
 
         box = col.box()
 
         row = box.row()
         row.label(
-            text="RESET",
-            icon='LOOP_BACK'
+            text="USE SELECTION",
+            icon='FACESEL'
         )
 
         box.separator(factor=0.3)
 
         col2 = box.column(align=True)
-
         col2.label(text="Tool: Transform")
         col2.label(text="Orientation: Normal")
         col2.label(text="Pivot: Active Element")
         col2.label(text="Snap: OFF")
         col2.label(text="Origins: OFF")
+
+        box.separator()
+
+        col2 = box.column(align=True)
+        col2.label(
+            text="RESET 3D CURSOR",
+            icon='LOOP_BACK'
+        )
+        col2.label(text="Location: 0, 0, 0")
+        col2.label(text="Rotation: 0, 0, 0")
 
         # ------------------------------------------------------------
         # AUTHOR
@@ -1937,11 +1948,11 @@ classes = (
     VIEW3D_OT_cursor_orient_to_face_under_mouse,
     VIEW3D_OT_alt_shift_mmb_dispatch,
     VIEW3D_OT_cursor_align_apply_setup,
-    VIEW3D_OT_cursor_align_edit_cursor,
+    VIEW3D_OT_reset_3d_cursor,
     VIEW3D_OT_edit_pivot,
     VIEW3D_OT_edit_pivot_raycast,
     VIEW3D_OT_cursor_align_use_cursor,
-    VIEW3D_OT_cursor_align_reset,
+    VIEW3D_OT_cursor_align_use_selection,
     VIEW3D_OT_cursor_align_origin_to_geometry, 
     VIEW3D_PT_cursor_align_sidebar,
     VIEW3D_PT_viewport_tools,
@@ -1964,8 +1975,8 @@ def register():
         bpy.utils.register_class(cls)
         
     bpy.types.Scene.cursor_align_enabled = bpy.props.BoolProperty(
-        name="Cursor Align Enabled",
-        description="Enable Alt+Shift+MMB to orient the 3D cursor to the face under the mouse",
+        name="Edit 3D Cursor",
+        description="Edit the 3D Cursor with vertex snapping and use Alt+Shift+MMB to align its rotation to a face",
         default=False,
         update=update_enabled,
     )
