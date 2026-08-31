@@ -2,7 +2,7 @@
 bl_info = {
     "name": "KustomTools",
     "author": "Álvaro_A",
-    "version": (1, 9, 0),
+    "version": (1, 9, 1),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Kustom Tools",
     "description": "Orient Cursor tools and basic color settings to improve experience",
@@ -1447,6 +1447,8 @@ class KT_OT_circularize_loop(bpy.types.Operator):
 
 KT_RIG_SHAPE_COLLECTION = "KustomTools_RigShapes"
 KT_RIG_SHAPE_PREFIX = "KT_RigShape_"
+KT_CONTROLLER_PREFIX = "CTRL_"
+KT_CONTROLLER_CONSTRAINT = "KustomTools Controller"
 
 
 def kt_get_selected_pose_bones(context):
@@ -1474,7 +1476,7 @@ def kt_collection_contains(root_collection, target_collection):
 
 
 def kt_get_rig_shape_collection(context):
-    """Create/reuse the collection that stores custom controller shape meshes."""
+    """Create/reuse the collection that stores controller Custom Shape meshes."""
     collection = bpy.data.collections.get(KT_RIG_SHAPE_COLLECTION)
 
     if collection is None:
@@ -1489,13 +1491,12 @@ def kt_get_rig_shape_collection(context):
 
 
 def kt_rig_shape_geometry(shape_type):
-    """Return vertices and edges for a controller mesh in bone-local coordinates.
+    """Return vertices and edges for a controller shape in bone-local coordinates.
 
-    Custom shapes use Y as the bone direction. Most 2D presets are therefore
-    centered halfway along Y and drawn in the local XZ plane so they surround
-    the bone rather than lying along it.
+    The shape is centered at Y=0, which is the HEAD / origin of the controller
+    bone. Y is the bone direction, so the 2D presets are drawn in the XZ plane.
     """
-    center_y = 0.5
+    center_y = 0.0
 
     if shape_type == 'CIRCLE':
         segments = 32
@@ -1535,8 +1536,8 @@ def kt_rig_shape_geometry(shape_type):
 
     if shape_type == 'BOX':
         r = 0.45
-        y0 = 0.12
-        y1 = 0.88
+        y0 = -0.38
+        y1 = 0.38
         verts = [
             (-r, y0, -r),
             ( r, y0, -r),
@@ -1555,7 +1556,6 @@ def kt_rig_shape_geometry(shape_type):
         return verts, edges
 
     if shape_type == 'CROSS':
-        # Closed plus-sign outline in the XZ plane.
         a = 0.18
         b = 0.58
         points = [
@@ -1571,11 +1571,20 @@ def kt_rig_shape_geometry(shape_type):
 
 
 def kt_get_or_create_rig_shape(context, shape_type):
-    """Create/reuse the hidden mesh object used as a Blender Custom Shape."""
+    """Create/reuse the hidden mesh object used by controller bones as Custom Shape."""
     object_name = f"{KT_RIG_SHAPE_PREFIX}{shape_type.title()}"
     shape_obj = bpy.data.objects.get(object_name)
 
-    if shape_obj is not None and shape_obj.type == 'MESH':
+    # Rebuild old v1.9 shapes because those were centered at the bone midpoint.
+    if shape_obj is not None:
+        if shape_obj.type != 'MESH':
+            bpy.data.objects.remove(shape_obj, do_unlink=True)
+            shape_obj = None
+        elif not shape_obj.get("kt_origin_centered", False):
+            bpy.data.objects.remove(shape_obj, do_unlink=True)
+            shape_obj = None
+
+    if shape_obj is not None:
         return shape_obj
 
     verts, edges = kt_rig_shape_geometry(shape_type)
@@ -1588,12 +1597,11 @@ def kt_get_or_create_rig_shape(context, shape_type):
     collection = kt_get_rig_shape_collection(context)
     collection.objects.link(shape_obj)
 
+    shape_obj["kt_origin_centered"] = True
     shape_obj.hide_render = True
     shape_obj.hide_select = True
     shape_obj.display_type = 'WIRE'
 
-    # The template object itself should not clutter the scene. Blender still
-    # uses it as the bone custom-shape template while hidden.
     try:
         shape_obj.hide_set(True)
     except Exception:
@@ -1610,7 +1618,7 @@ def kt_lighter_color(color, factor, offset=0.0):
 
 
 def kt_apply_bone_controller_color(pose_bone, color):
-    """Apply a custom color to the pose bone and its underlying bone."""
+    """Apply a custom color to a controller Pose Bone."""
     normal = tuple(color[:3])
     selected = kt_lighter_color(normal, 1.20, 0.06)
     active = kt_lighter_color(normal, 1.42, 0.10)
@@ -1631,38 +1639,247 @@ def kt_apply_bone_controller_color(pose_bone, color):
             pass
 
 
-def kt_configure_pose_bone_controller(context, pose_bone, shape_type):
-    """Assign a custom controller shape to one selected pose bone."""
+def kt_configure_controller_bone(context, controller_bone, shape_type):
+    """Assign shape and color to a separate non-deform controller bone."""
     shape_obj = kt_get_or_create_rig_shape(context, shape_type)
 
-    pose_bone.custom_shape = shape_obj
-    pose_bone.use_custom_shape_bone_size = True
-    pose_bone.custom_shape_translation = (0.0, 0.0, 0.0)
-    pose_bone.custom_shape_rotation_euler = (0.0, 0.0, 0.0)
-    pose_bone.custom_shape_scale_xyz = (1.0, 1.0, 1.0)
+    controller_bone.custom_shape = shape_obj
+    controller_bone.use_custom_shape_bone_size = True
+    controller_bone.custom_shape_translation = (0.0, 0.0, 0.0)
+    controller_bone.custom_shape_rotation_euler = (0.0, 0.0, 0.0)
+    controller_bone.custom_shape_scale_xyz = (1.0, 1.0, 1.0)
 
     try:
-        pose_bone.custom_shape_wire_width = 2.0
-    except Exception:
-        pass
-
-    try:
-        pose_bone.bone.show_wire = True
+        controller_bone.custom_shape_wire_width = 2.0
     except Exception:
         pass
 
     kt_apply_bone_controller_color(
-        pose_bone,
+        controller_bone,
         context.scene.kt_rig_controller_color,
     )
+
+
+def kt_unique_controller_name(armature_obj, source_name):
+    """Return a stable, non-conflicting controller-bone name for source_name."""
+    source_pose = armature_obj.pose.bones.get(source_name)
+    stored_name = source_pose.get("kt_controller_bone") if source_pose else None
+
+    if stored_name:
+        stored_pose = armature_obj.pose.bones.get(stored_name)
+        if stored_pose and stored_pose.get("kt_source_bone") == source_name:
+            return stored_name
+
+    base_name = f"{KT_CONTROLLER_PREFIX}{source_name}"
+    existing = armature_obj.pose.bones.get(base_name)
+    if existing is None or existing.get("kt_source_bone") == source_name:
+        return base_name
+
+    index = 1
+    while True:
+        candidate = f"{base_name}.{index:03d}"
+        existing = armature_obj.pose.bones.get(candidate)
+        if existing is None or existing.get("kt_source_bone") == source_name:
+            return candidate
+        index += 1
+
+
+def kt_resolve_controller_pose_bones(context):
+    """Resolve selected source/controller bones to their controller Pose Bones."""
+    armature_obj = context.active_object
+    selected = kt_get_selected_pose_bones(context)
+    controllers = []
+    seen = set()
+
+    for pose_bone in selected:
+        controller = None
+
+        # The selected bone is already one of our controller bones.
+        if pose_bone.get("kt_source_bone"):
+            controller = pose_bone
+        else:
+            controller_name = pose_bone.get("kt_controller_bone")
+            if controller_name:
+                controller = armature_obj.pose.bones.get(controller_name)
+
+            if controller is None:
+                candidate = armature_obj.pose.bones.get(
+                    f"{KT_CONTROLLER_PREFIX}{pose_bone.name}"
+                )
+                if candidate and candidate.get("kt_source_bone") == pose_bone.name:
+                    controller = candidate
+
+        if controller is not None and controller.name not in seen:
+            seen.add(controller.name)
+            controllers.append(controller)
+
+    return controllers
+
+
+def kt_add_controller_constraint(armature_obj, source_pose, controller_pose):
+    """Make source_pose follow controller_pose without replacing source display."""
+    constraint = source_pose.constraints.get(KT_CONTROLLER_CONSTRAINT)
+    if constraint is None or constraint.type != 'COPY_TRANSFORMS':
+        if constraint is not None:
+            source_pose.constraints.remove(constraint)
+        constraint = source_pose.constraints.new('COPY_TRANSFORMS')
+        constraint.name = KT_CONTROLLER_CONSTRAINT
+
+    constraint.target = armature_obj
+    constraint.subtarget = controller_pose.name
+
+    # Source and controller bones share the same rest transform. Copying their
+    # LOCAL pose offsets keeps normal bone parenting behaviour intact.
+    try:
+        constraint.target_space = 'LOCAL'
+        constraint.owner_space = 'LOCAL'
+    except Exception:
+        pass
+
+    try:
+        constraint.mix_mode = 'REPLACE'
+    except Exception:
+        pass
+
+
+def kt_create_controller_bones(context, source_pose_bones):
+    """Create separate non-deform controller bones for selected source bones."""
+    armature_obj = context.active_object
+    source_names = [bone.name for bone in source_pose_bones]
+
+    controller_names = {
+        source_name: kt_unique_controller_name(armature_obj, source_name)
+        for source_name in source_names
+    }
+
+    source_parent_names = {
+        source_name: (
+            armature_obj.pose.bones[source_name].parent.name
+            if armature_obj.pose.bones[source_name].parent
+            else None
+        )
+        for source_name in source_names
+    }
+
+    # Resolve already-existing parent controllers before entering Edit Mode.
+    existing_parent_controllers = {}
+    for source_name, parent_source_name in source_parent_names.items():
+        parent_controller_name = None
+        if parent_source_name:
+            parent_source_pose = armature_obj.pose.bones.get(parent_source_name)
+            if parent_source_pose:
+                stored_name = parent_source_pose.get("kt_controller_bone")
+                if stored_name and armature_obj.pose.bones.get(stored_name):
+                    parent_controller_name = stored_name
+                else:
+                    candidate = armature_obj.pose.bones.get(
+                        f"{KT_CONTROLLER_PREFIX}{parent_source_name}"
+                    )
+                    if (
+                        candidate
+                        and candidate.get("kt_source_bone") == parent_source_name
+                    ):
+                        parent_controller_name = candidate.name
+        existing_parent_controllers[source_name] = parent_controller_name
+
+    # Switch briefly to Edit Mode to create real controller bones. The original
+    # bones remain untouched and visible.
+    bpy.ops.object.mode_set(mode='EDIT')
+    edit_bones = armature_obj.data.edit_bones
+
+    # First pass: create/copy transforms.
+    for source_name in source_names:
+        source_edit = edit_bones.get(source_name)
+        if source_edit is None:
+            continue
+
+        controller_name = controller_names[source_name]
+        controller_edit = edit_bones.get(controller_name)
+
+        if controller_edit is None:
+            controller_edit = edit_bones.new(controller_name)
+
+        controller_edit.head = source_edit.head.copy()
+        controller_edit.tail = source_edit.tail.copy()
+        controller_edit.roll = source_edit.roll
+        controller_edit.use_connect = False
+
+        try:
+            controller_edit.use_deform = False
+        except Exception:
+            pass
+
+    # Second pass: mirror the hierarchy without parenting a controller to the
+    # bone it controls (which would create a dependency cycle).
+    for source_name in source_names:
+        controller_edit = edit_bones.get(controller_names[source_name])
+        if controller_edit is None:
+            continue
+
+        parent_source_name = source_parent_names[source_name]
+        parent_controller = None
+
+        if parent_source_name:
+            if parent_source_name in controller_names:
+                parent_controller = edit_bones.get(
+                    controller_names[parent_source_name]
+                )
+            else:
+                existing_name = existing_parent_controllers.get(source_name)
+                if existing_name:
+                    parent_controller = edit_bones.get(existing_name)
+
+            # If the parent has no controller, inherit directly from the source
+            # parent bone. This is safe because it is upstream, not the bone
+            # controlled by this controller.
+            if parent_controller is None:
+                parent_controller = edit_bones.get(parent_source_name)
+
+        controller_edit.parent = parent_controller
+        controller_edit.use_connect = False
+
+    bpy.ops.object.mode_set(mode='POSE')
+
+    created_controllers = []
+
+    for source_name in source_names:
+        source_pose = armature_obj.pose.bones.get(source_name)
+        controller_pose = armature_obj.pose.bones.get(controller_names[source_name])
+
+        if source_pose is None or controller_pose is None:
+            continue
+
+        # Clear v1.9 Custom Shapes from the source bone so the original bone is
+        # visible again. The Custom Shape now belongs to the separate controller.
+        source_pose.custom_shape = None
+
+        source_pose["kt_controller_bone"] = controller_pose.name
+        controller_pose["kt_source_bone"] = source_pose.name
+        controller_pose.bone.use_deform = False
+
+        kt_configure_controller_bone(context, controller_pose, 'CIRCLE')
+        kt_add_controller_constraint(armature_obj, source_pose, controller_pose)
+        created_controllers.append(controller_pose)
+
+    # Select the new controllers so the animator can use them immediately.
+    for data_bone in armature_obj.data.bones:
+        data_bone.select = False
+
+    for controller_pose in created_controllers:
+        controller_pose.bone.select = True
+
+    if created_controllers:
+        armature_obj.data.bones.active = created_controllers[-1].bone
+
+    return created_controllers
 
 
 class KT_OT_create_controllers(bpy.types.Operator):
     bl_idname = "kt.create_controllers"
     bl_label = "Create Controller"
     bl_description = (
-        "Assign a circular Blender Custom Shape to every selected pose bone so "
-        "the bone can be animated through a clean viewport controller"
+        "Create a separate non-deform controller bone at the selected bone origin; "
+        "the original bone stays visible and follows the controller"
     )
     bl_options = {'REGISTER', 'UNDO'}
 
@@ -1676,10 +1893,20 @@ class KT_OT_create_controllers(bpy.types.Operator):
         )
 
     def execute(self, context):
-        pose_bones = kt_get_selected_pose_bones(context)
+        source_pose_bones = kt_get_selected_pose_bones(context)
 
-        if not pose_bones:
+        if not source_pose_bones:
             self.report({'WARNING'}, "Select at least one bone in Pose Mode")
+            return {'CANCELLED'}
+
+        # Do not create controllers from controllers selected by accident.
+        source_pose_bones = [
+            bone for bone in source_pose_bones
+            if not bone.get("kt_source_bone")
+        ]
+
+        if not source_pose_bones:
+            self.report({'WARNING'}, "Select original bones, not controller bones")
             return {'CANCELLED'}
 
         armature_obj = context.active_object
@@ -1687,13 +1914,12 @@ class KT_OT_create_controllers(bpy.types.Operator):
         armature_obj.data.show_bone_colors = True
         armature_obj.show_in_front = True
 
-        for pose_bone in pose_bones:
-            kt_configure_pose_bone_controller(context, pose_bone, 'CIRCLE')
+        controllers = kt_create_controller_bones(context, source_pose_bones)
 
         self.report(
             {'INFO'},
-            f"Created controller shape for {len(pose_bones)} bone"
-            f"{'s' if len(pose_bones) != 1 else ''}"
+            f"Created {len(controllers)} controller bone"
+            f"{'s' if len(controllers) != 1 else ''}"
         )
         return {'FINISHED'}
 
@@ -1701,7 +1927,7 @@ class KT_OT_create_controllers(bpy.types.Operator):
 class KT_OT_set_controller_shape(bpy.types.Operator):
     bl_idname = "kt.set_controller_shape"
     bl_label = "Set Controller Shape"
-    bl_description = "Change the custom controller shape of the selected pose bones"
+    bl_description = "Change the shape of selected controller bones"
     bl_options = {'REGISTER', 'UNDO'}
 
     shape_type: bpy.props.EnumProperty(
@@ -1726,26 +1952,29 @@ class KT_OT_set_controller_shape(bpy.types.Operator):
         )
 
     def execute(self, context):
-        pose_bones = kt_get_selected_pose_bones(context)
+        controller_bones = kt_resolve_controller_pose_bones(context)
 
-        if not pose_bones:
-            self.report({'WARNING'}, "Select at least one bone in Pose Mode")
+        if not controller_bones:
+            self.report(
+                {'WARNING'},
+                "Select a controller bone or an original bone with a controller"
+            )
             return {'CANCELLED'}
 
         context.active_object.data.show_bone_custom_shapes = True
 
-        for pose_bone in pose_bones:
-            kt_configure_pose_bone_controller(
+        for controller_bone in controller_bones:
+            kt_configure_controller_bone(
                 context,
-                pose_bone,
+                controller_bone,
                 self.shape_type,
             )
 
         shape_name = self.shape_type.title()
         self.report(
             {'INFO'},
-            f"Applied {shape_name} controller to {len(pose_bones)} bone"
-            f"{'s' if len(pose_bones) != 1 else ''}"
+            f"Applied {shape_name} to {len(controller_bones)} controller"
+            f"{'s' if len(controller_bones) != 1 else ''}"
         )
         return {'FINISHED'}
 
@@ -1753,7 +1982,7 @@ class KT_OT_set_controller_shape(bpy.types.Operator):
 class KT_OT_apply_controller_color(bpy.types.Operator):
     bl_idname = "kt.apply_controller_color"
     bl_label = "Apply Color"
-    bl_description = "Apply the chosen custom bone color to selected pose-bone controllers"
+    bl_description = "Apply the chosen color to selected controller bones"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -1766,22 +1995,25 @@ class KT_OT_apply_controller_color(bpy.types.Operator):
         )
 
     def execute(self, context):
-        pose_bones = kt_get_selected_pose_bones(context)
+        controller_bones = kt_resolve_controller_pose_bones(context)
 
-        if not pose_bones:
-            self.report({'WARNING'}, "Select at least one bone in Pose Mode")
+        if not controller_bones:
+            self.report(
+                {'WARNING'},
+                "Select a controller bone or an original bone with a controller"
+            )
             return {'CANCELLED'}
 
         context.active_object.data.show_bone_colors = True
         color = context.scene.kt_rig_controller_color
 
-        for pose_bone in pose_bones:
-            kt_apply_bone_controller_color(pose_bone, color)
+        for controller_bone in controller_bones:
+            kt_apply_bone_controller_color(controller_bone, color)
 
         self.report(
             {'INFO'},
-            f"Applied controller color to {len(pose_bones)} bone"
-            f"{'s' if len(pose_bones) != 1 else ''}"
+            f"Applied controller color to {len(controller_bones)} controller"
+            f"{'s' if len(controller_bones) != 1 else ''}"
         )
         return {'FINISHED'}
 
@@ -2344,7 +2576,9 @@ class VIEW3D_PT_info_panel(bpy.types.Panel):
 
         col2 = box.column(align=True)
         col2.label(text="Pose Mode: selected bones")
-        col2.label(text="Create Controller → Circle Custom Shape")
+        col2.label(text="Create Controller → separate control bone")
+        col2.label(text="Original bone stays visible")
+        col2.label(text="Shape centered at bone origin/head")
         col2.label(text="Shape presets + custom controller color")
 
         # ------------------------------------------------------------
@@ -2473,7 +2707,7 @@ def register():
 
     bpy.types.Scene.kt_rig_controller_color = bpy.props.FloatVectorProperty(
         name="Controller Color",
-        description="Custom color applied to selected pose-bone controllers",
+        description="Custom color applied to selected controller bones",
         subtype='COLOR',
         size=3,
         min=0.0,
