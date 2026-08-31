@@ -2,7 +2,7 @@
 bl_info = {
     "name": "KustomTools",
     "author": "Álvaro_A",
-    "version": (1, 6, 0),
+    "version": (1, 7, 0),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Kustom Tools",
     "description": "Orient Cursor tools and basic color settings to improve experience",
@@ -501,7 +501,7 @@ class VIEW3D_OT_cursor_align_reset(bpy.types.Operator):
 
 class VIEW3D_OT_cursor_align_origin_to_geometry(bpy.types.Operator):
     bl_idname = "view3d.cursor_align_origin_to_geometry"
-    bl_label = "◎ → ◼"
+    bl_label = "Origin to Geometry"
     bl_description = "Set object origin to geometry"
 
     def execute(self, context):
@@ -767,6 +767,20 @@ class KT_OT_delete_unused_materials(bpy.types.Operator):
         "materials kept alive only by orphaned datablocks"
     )
     bl_options = {'REGISTER', 'UNDO'}
+
+    def invoke(self, context, event):
+        used_materials = get_materials_used_by_scene_objects()
+        unused_count = sum(
+            1 for mat in bpy.data.materials
+            if mat not in used_materials and not mat.use_fake_user
+        )
+
+        if unused_count == 0:
+            self.report({'INFO'}, "No unused materials found")
+            return {'CANCELLED'}
+
+        # Explicit confirmation protects against accidental cleanup.
+        return context.window_manager.invoke_confirm(self, event)
 
     def execute(self, context):
         used_materials = get_materials_used_by_scene_objects()
@@ -1066,6 +1080,65 @@ def kt_rotate_list(values, offset):
     return values[offset:] + values[:offset]
 
 
+def kt_get_modeling_loop_edges(context, obj, bm):
+    """Return the loop edges to process from the current Edit Mode selection.
+
+    If faces are selected, convert the selected face region to its boundary
+    edges first. Otherwise use the currently selected edges as-is.
+    """
+    bm.verts.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
+
+    selected_faces = [face for face in bm.faces if face.select]
+
+    if selected_faces:
+        selected_face_set = set(selected_faces)
+        boundary_edges = []
+
+        for edge in bm.edges:
+            selected_linked_faces = sum(
+                1 for face in edge.link_faces
+                if face in selected_face_set
+            )
+
+            if selected_linked_faces == 1:
+                boundary_edges.append(edge)
+
+        if not boundary_edges:
+            raise RuntimeError(
+                "Selected faces do not produce a usable boundary edge loop"
+            )
+
+        # Convert the visible selection from faces to boundary edges.
+        for face in bm.faces:
+            face.select = False
+
+        for edge in bm.edges:
+            edge.select = False
+
+        for vert in bm.verts:
+            vert.select = False
+
+        for edge in boundary_edges:
+            edge.select = True
+            for vert in edge.verts:
+                vert.select = True
+
+        context.tool_settings.mesh_select_mode = (False, True, False)
+        bm.select_mode = {'EDGE'}
+
+        bmesh.update_edit_mesh(
+            obj.data,
+            loop_triangles=False,
+            destructive=False,
+        )
+
+        return boundary_edges
+
+    return [edge for edge in bm.edges if edge.select]
+
+
 class KT_OT_quadrangulate_loop(bpy.types.Operator):
     bl_idname = "kt.quadrangulate_loop"
     bl_label = "Quadrangulate Loop"
@@ -1091,10 +1164,14 @@ class KT_OT_quadrangulate_loop(bpy.types.Operator):
         bm.verts.ensure_lookup_table()
         bm.edges.ensure_lookup_table()
 
-        selected_edges = [edge for edge in bm.edges if edge.select]
+        try:
+            selected_edges = kt_get_modeling_loop_edges(context, obj, bm)
+        except RuntimeError as error:
+            self.report({'WARNING'}, str(error))
+            return {'CANCELLED'}
 
         if not selected_edges:
-            self.report({'WARNING'}, "Select one complete closed edge loop")
+            self.report({'WARNING'}, "Select a closed edge loop or a face region")
             return {'CANCELLED'}
 
         try:
@@ -1243,10 +1320,14 @@ class KT_OT_circularize_loop(bpy.types.Operator):
         bm.verts.ensure_lookup_table()
         bm.edges.ensure_lookup_table()
 
-        selected_edges = [edge for edge in bm.edges if edge.select]
+        try:
+            selected_edges = kt_get_modeling_loop_edges(context, obj, bm)
+        except RuntimeError as error:
+            self.report({'WARNING'}, str(error))
+            return {'CANCELLED'}
 
         if not selected_edges:
-            self.report({'WARNING'}, "Select one complete closed edge loop")
+            self.report({'WARNING'}, "Select a closed edge loop or a face region")
             return {'CANCELLED'}
 
         try:
@@ -1475,19 +1556,14 @@ class VIEW3D_PT_cursor_align_sidebar(bpy.types.Panel):
         
         col.separator()
 
-        # 👉 fila  (Origins)
+        # Origin to Geometry - compact icon-only utility button.
         row = col.row(align=True)
-        row.operator("view3d.cursor_align_origin_to_geometry")
-        row.operator("view3d.cursor_align_origin_to_cursor")
-
-        # 👉 fila  (Snap SOLO)
-        row = col.row(align=True)
-        row.operator("view3d.cursor_align_snap_mid")
-        
-        # 👉 Selection / Cursor
-        row = col.row(align=True)
-        row.operator("view3d.selection_to_cursor")
-        row.operator("view3d.cursor_to_selected")
+        row.enabled = context.mode == 'OBJECT'
+        row.operator(
+            "view3d.cursor_align_origin_to_geometry",
+            text="",
+            icon='GIZMO'
+        )
         col.separator()
 
         status_box = col.box()
@@ -1636,9 +1712,9 @@ class VIEW3D_PT_modeling_tools(bpy.types.Panel):
         layout = self.layout
         col = layout.column(align=True)
 
-        box = col.box()
-        box.label(text="Edge Loop", icon='MESH_GRID')
+        col.label(text="Edge Loop", icon='MESH_GRID')
 
+        box = col.box()
         row = box.row(align=True)
         row.enabled = context.mode == 'EDIT_MESH'
         row.operator(
@@ -1789,29 +1865,6 @@ class VIEW3D_PT_info_panel(bpy.types.Panel):
         )
         col2.label(text="Set origin to geometry")
 
-        box.separator()
-
-        col2 = box.column(align=True)
-
-        col2.label(
-            text="ORIGIN TO CURSOR",
-            icon='CURSOR'
-        )
-        col2.label(text="Set origin to 3D Cursor")
-
-        box.separator()
-
-        col2 = box.column(align=True)
-
-        col2.label(
-            text="SNAP POINT",
-            icon='SNAP_VERTEX'
-        )
-        col2.label(text="Origin → Cursor")
-        col2.label(text="Snap: Vertex")
-        col2.label(text="Target: Center")
-        col2.label(text="Orientation: Local")
-
         # ------------------------------------------------------------
         # CURSOR TOOLS
         # ------------------------------------------------------------
@@ -1835,26 +1888,6 @@ class VIEW3D_PT_info_panel(bpy.types.Panel):
         col2.label(text="Tool: Transform")
         col2.label(text="Pivot: 3D Cursor")
         col2.label(text="Snap: OFF")
-
-        box.separator()
-
-        col2 = box.column(align=True)
-
-        col2.label(
-            text="SELECTION TO CURSOR",
-            icon='MESH_CUBE'
-        )
-        col2.label(text="Move selection to Cursor")
-
-        box.separator()
-
-        col2 = box.column(align=True)
-
-        col2.label(
-            text="CURSOR TO SELECTED",
-            icon='CURSOR'
-        )
-        col2.label(text="Move Cursor to selection")
 
         # ------------------------------------------------------------
         # RESET
@@ -1909,15 +1942,11 @@ classes = (
     VIEW3D_OT_edit_pivot_raycast,
     VIEW3D_OT_cursor_align_use_cursor,
     VIEW3D_OT_cursor_align_reset,
-    VIEW3D_OT_cursor_align_snap_mid,
     VIEW3D_OT_cursor_align_origin_to_geometry, 
     VIEW3D_PT_cursor_align_sidebar,
     VIEW3D_PT_viewport_tools,
     VIEW3D_PT_material_tools,
     VIEW3D_PT_modeling_tools,
-    VIEW3D_OT_cursor_align_origin_to_cursor,
-    VIEW3D_OT_selection_to_cursor,
-    VIEW3D_OT_cursor_to_selected,
     VIEW3D_PT_info_panel,
     CT_OT_enable_dynamic_bg,
     CT_OT_set_active_object_color,
