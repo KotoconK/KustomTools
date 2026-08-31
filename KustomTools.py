@@ -2,7 +2,7 @@
 bl_info = {
     "name": "KustomTools",
     "author": "Álvaro_A",
-    "version": (1, 8, 0),
+    "version": (1, 9, 0),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Kustom Tools",
     "description": "Orient Cursor tools and basic color settings to improve experience",
@@ -451,13 +451,13 @@ class VIEW3D_OT_alt_shift_mmb_dispatch(
         return {'CANCELLED'}
 class VIEW3D_OT_cursor_align_apply_setup(bpy.types.Operator):
     bl_idname = "view3d.cursor_align_apply_setup"
-    bl_label = "◎ Use Origin"
-    bl_description = "Apply Transform tool, Individual Origins and Cursor orientation"
+    bl_label = "Use Sel Oriented"
+    bl_description = "Use the current selection with Transform Orientation set to the 3D Cursor"
 
     def execute(self, context):
         apply_user_setup(context)
-        set_status(context, "Setup applied")
-        self.report({'INFO'}, "Setup applied")
+        set_status(context, "Using Selection Oriented by 3D Cursor")
+        self.report({'INFO'}, "Use Selection Oriented enabled")
         return {'FINISHED'}
 
 
@@ -1442,6 +1442,351 @@ class KT_OT_circularize_loop(bpy.types.Operator):
 
 
 # ------------------------------------------------------------
+# RIG TOOLS
+# ------------------------------------------------------------
+
+KT_RIG_SHAPE_COLLECTION = "KustomTools_RigShapes"
+KT_RIG_SHAPE_PREFIX = "KT_RigShape_"
+
+
+def kt_get_selected_pose_bones(context):
+    """Return selected Pose Bones from the active armature."""
+    obj = context.active_object
+
+    if (
+        context.mode != 'POSE'
+        or obj is None
+        or obj.type != 'ARMATURE'
+    ):
+        return []
+
+    return list(getattr(context, "selected_pose_bones", None) or [])
+
+
+def kt_collection_contains(root_collection, target_collection):
+    """Return True when target_collection is already below root_collection."""
+    for child in root_collection.children:
+        if child == target_collection:
+            return True
+        if kt_collection_contains(child, target_collection):
+            return True
+    return False
+
+
+def kt_get_rig_shape_collection(context):
+    """Create/reuse the collection that stores custom controller shape meshes."""
+    collection = bpy.data.collections.get(KT_RIG_SHAPE_COLLECTION)
+
+    if collection is None:
+        collection = bpy.data.collections.new(KT_RIG_SHAPE_COLLECTION)
+
+    scene_root = context.scene.collection
+    if not kt_collection_contains(scene_root, collection):
+        scene_root.children.link(collection)
+
+    collection.hide_render = True
+    return collection
+
+
+def kt_rig_shape_geometry(shape_type):
+    """Return vertices and edges for a controller mesh in bone-local coordinates.
+
+    Custom shapes use Y as the bone direction. Most 2D presets are therefore
+    centered halfway along Y and drawn in the local XZ plane so they surround
+    the bone rather than lying along it.
+    """
+    center_y = 0.5
+
+    if shape_type == 'CIRCLE':
+        segments = 32
+        radius = 0.55
+        verts = [
+            (
+                math.cos((2.0 * math.pi * i) / segments) * radius,
+                center_y,
+                math.sin((2.0 * math.pi * i) / segments) * radius,
+            )
+            for i in range(segments)
+        ]
+        edges = [(i, (i + 1) % segments) for i in range(segments)]
+        return verts, edges
+
+    if shape_type == 'SQUARE':
+        r = 0.55
+        verts = [
+            (-r, center_y, -r),
+            ( r, center_y, -r),
+            ( r, center_y,  r),
+            (-r, center_y,  r),
+        ]
+        edges = [(0, 1), (1, 2), (2, 3), (3, 0)]
+        return verts, edges
+
+    if shape_type == 'DIAMOND':
+        r = 0.72
+        verts = [
+            (0.0, center_y, -r),
+            ( r, center_y, 0.0),
+            (0.0, center_y,  r),
+            (-r, center_y, 0.0),
+        ]
+        edges = [(0, 1), (1, 2), (2, 3), (3, 0)]
+        return verts, edges
+
+    if shape_type == 'BOX':
+        r = 0.45
+        y0 = 0.12
+        y1 = 0.88
+        verts = [
+            (-r, y0, -r),
+            ( r, y0, -r),
+            ( r, y0,  r),
+            (-r, y0,  r),
+            (-r, y1, -r),
+            ( r, y1, -r),
+            ( r, y1,  r),
+            (-r, y1,  r),
+        ]
+        edges = [
+            (0, 1), (1, 2), (2, 3), (3, 0),
+            (4, 5), (5, 6), (6, 7), (7, 4),
+            (0, 4), (1, 5), (2, 6), (3, 7),
+        ]
+        return verts, edges
+
+    if shape_type == 'CROSS':
+        # Closed plus-sign outline in the XZ plane.
+        a = 0.18
+        b = 0.58
+        points = [
+            (-a, -b), ( a, -b), ( a, -a), ( b, -a),
+            ( b,  a), ( a,  a), ( a,  b), (-a,  b),
+            (-a,  a), (-b,  a), (-b, -a), (-a, -a),
+        ]
+        verts = [(x, center_y, z) for x, z in points]
+        edges = [(i, (i + 1) % len(verts)) for i in range(len(verts))]
+        return verts, edges
+
+    raise ValueError(f"Unknown controller shape: {shape_type}")
+
+
+def kt_get_or_create_rig_shape(context, shape_type):
+    """Create/reuse the hidden mesh object used as a Blender Custom Shape."""
+    object_name = f"{KT_RIG_SHAPE_PREFIX}{shape_type.title()}"
+    shape_obj = bpy.data.objects.get(object_name)
+
+    if shape_obj is not None and shape_obj.type == 'MESH':
+        return shape_obj
+
+    verts, edges = kt_rig_shape_geometry(shape_type)
+
+    mesh = bpy.data.meshes.new(f"{object_name}_Mesh")
+    mesh.from_pydata(verts, edges, [])
+    mesh.update()
+
+    shape_obj = bpy.data.objects.new(object_name, mesh)
+    collection = kt_get_rig_shape_collection(context)
+    collection.objects.link(shape_obj)
+
+    shape_obj.hide_render = True
+    shape_obj.hide_select = True
+    shape_obj.display_type = 'WIRE'
+
+    # The template object itself should not clutter the scene. Blender still
+    # uses it as the bone custom-shape template while hidden.
+    try:
+        shape_obj.hide_set(True)
+    except Exception:
+        pass
+
+    return shape_obj
+
+
+def kt_lighter_color(color, factor, offset=0.0):
+    return tuple(
+        max(0.0, min(1.0, channel * factor + offset))
+        for channel in color
+    )
+
+
+def kt_apply_bone_controller_color(pose_bone, color):
+    """Apply a custom color to the pose bone and its underlying bone."""
+    normal = tuple(color[:3])
+    selected = kt_lighter_color(normal, 1.20, 0.06)
+    active = kt_lighter_color(normal, 1.42, 0.10)
+
+    for bone_color in (
+        getattr(pose_bone, "color", None),
+        getattr(pose_bone.bone, "color", None),
+    ):
+        if bone_color is None:
+            continue
+
+        try:
+            bone_color.palette = 'CUSTOM'
+            bone_color.custom.normal = normal
+            bone_color.custom.select = selected
+            bone_color.custom.active = active
+        except Exception:
+            pass
+
+
+def kt_configure_pose_bone_controller(context, pose_bone, shape_type):
+    """Assign a custom controller shape to one selected pose bone."""
+    shape_obj = kt_get_or_create_rig_shape(context, shape_type)
+
+    pose_bone.custom_shape = shape_obj
+    pose_bone.use_custom_shape_bone_size = True
+    pose_bone.custom_shape_translation = (0.0, 0.0, 0.0)
+    pose_bone.custom_shape_rotation_euler = (0.0, 0.0, 0.0)
+    pose_bone.custom_shape_scale_xyz = (1.0, 1.0, 1.0)
+
+    try:
+        pose_bone.custom_shape_wire_width = 2.0
+    except Exception:
+        pass
+
+    try:
+        pose_bone.bone.show_wire = True
+    except Exception:
+        pass
+
+    kt_apply_bone_controller_color(
+        pose_bone,
+        context.scene.kt_rig_controller_color,
+    )
+
+
+class KT_OT_create_controllers(bpy.types.Operator):
+    bl_idname = "kt.create_controllers"
+    bl_label = "Create Controller"
+    bl_description = (
+        "Assign a circular Blender Custom Shape to every selected pose bone so "
+        "the bone can be animated through a clean viewport controller"
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return (
+            context.mode == 'POSE'
+            and obj is not None
+            and obj.type == 'ARMATURE'
+        )
+
+    def execute(self, context):
+        pose_bones = kt_get_selected_pose_bones(context)
+
+        if not pose_bones:
+            self.report({'WARNING'}, "Select at least one bone in Pose Mode")
+            return {'CANCELLED'}
+
+        armature_obj = context.active_object
+        armature_obj.data.show_bone_custom_shapes = True
+        armature_obj.data.show_bone_colors = True
+        armature_obj.show_in_front = True
+
+        for pose_bone in pose_bones:
+            kt_configure_pose_bone_controller(context, pose_bone, 'CIRCLE')
+
+        self.report(
+            {'INFO'},
+            f"Created controller shape for {len(pose_bones)} bone"
+            f"{'s' if len(pose_bones) != 1 else ''}"
+        )
+        return {'FINISHED'}
+
+
+class KT_OT_set_controller_shape(bpy.types.Operator):
+    bl_idname = "kt.set_controller_shape"
+    bl_label = "Set Controller Shape"
+    bl_description = "Change the custom controller shape of the selected pose bones"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    shape_type: bpy.props.EnumProperty(
+        name="Shape",
+        items=(
+            ('CIRCLE', "Circle", "Circular controller"),
+            ('SQUARE', "Square", "Square controller"),
+            ('DIAMOND', "Diamond", "Diamond controller"),
+            ('BOX', "Box", "3D box controller"),
+            ('CROSS', "Cross", "Cross controller"),
+        ),
+        default='CIRCLE',
+    )
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return (
+            context.mode == 'POSE'
+            and obj is not None
+            and obj.type == 'ARMATURE'
+        )
+
+    def execute(self, context):
+        pose_bones = kt_get_selected_pose_bones(context)
+
+        if not pose_bones:
+            self.report({'WARNING'}, "Select at least one bone in Pose Mode")
+            return {'CANCELLED'}
+
+        context.active_object.data.show_bone_custom_shapes = True
+
+        for pose_bone in pose_bones:
+            kt_configure_pose_bone_controller(
+                context,
+                pose_bone,
+                self.shape_type,
+            )
+
+        shape_name = self.shape_type.title()
+        self.report(
+            {'INFO'},
+            f"Applied {shape_name} controller to {len(pose_bones)} bone"
+            f"{'s' if len(pose_bones) != 1 else ''}"
+        )
+        return {'FINISHED'}
+
+
+class KT_OT_apply_controller_color(bpy.types.Operator):
+    bl_idname = "kt.apply_controller_color"
+    bl_label = "Apply Color"
+    bl_description = "Apply the chosen custom bone color to selected pose-bone controllers"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return (
+            context.mode == 'POSE'
+            and obj is not None
+            and obj.type == 'ARMATURE'
+        )
+
+    def execute(self, context):
+        pose_bones = kt_get_selected_pose_bones(context)
+
+        if not pose_bones:
+            self.report({'WARNING'}, "Select at least one bone in Pose Mode")
+            return {'CANCELLED'}
+
+        context.active_object.data.show_bone_colors = True
+        color = context.scene.kt_rig_controller_color
+
+        for pose_bone in pose_bones:
+            kt_apply_bone_controller_color(pose_bone, color)
+
+        self.report(
+            {'INFO'},
+            f"Applied controller color to {len(pose_bones)} bone"
+            f"{'s' if len(pose_bones) != 1 else ''}"
+        )
+        return {'FINISHED'}
+
+
+# ------------------------------------------------------------
 # Keymap
 # ------------------------------------------------------------
 
@@ -1574,11 +1919,15 @@ class VIEW3D_PT_cursor_align_sidebar(bpy.types.Panel):
         )
 
         # ------------------------------------------------------------
-        # USE ORIGIN / USE CURSOR
+        # USE SELECTION ORIENTED / USE CURSOR
         # ------------------------------------------------------------
 
         row = col.row(align=True)
-        row.operator("view3d.cursor_align_apply_setup")
+        row.operator(
+            "view3d.cursor_align_apply_setup",
+            text="Use Sel Oriented",
+            icon='ORIENTATION_CURSOR'
+        )
         row.operator("view3d.cursor_align_use_cursor")
 
         col.separator()
@@ -1742,6 +2091,68 @@ class VIEW3D_PT_modeling_tools(bpy.types.Panel):
         )
 
 
+class VIEW3D_PT_rig_tools(bpy.types.Panel):
+    bl_label = "Rig Tools"
+    bl_idname = "VIEW3D_PT_rig_tools"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "KustomTools"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        scene = context.scene
+        is_pose_mode = (
+            context.mode == 'POSE'
+            and context.active_object is not None
+            and context.active_object.type == 'ARMATURE'
+        )
+
+        col = layout.column(align=True)
+
+        row = col.row(align=True)
+        row.enabled = is_pose_mode
+        row.operator(
+            "kt.create_controllers",
+            text="Create Controller",
+            icon='BONE_DATA'
+        )
+
+        col.separator(factor=0.5)
+        col.label(text="Shape Presets")
+
+        row = col.row(align=True)
+        row.enabled = is_pose_mode
+        op = row.operator("kt.set_controller_shape", text="Circle")
+        op.shape_type = 'CIRCLE'
+        op = row.operator("kt.set_controller_shape", text="Square")
+        op.shape_type = 'SQUARE'
+        op = row.operator("kt.set_controller_shape", text="Diamond")
+        op.shape_type = 'DIAMOND'
+
+        row = col.row(align=True)
+        row.enabled = is_pose_mode
+        op = row.operator("kt.set_controller_shape", text="Box")
+        op.shape_type = 'BOX'
+        op = row.operator("kt.set_controller_shape", text="Cross")
+        op.shape_type = 'CROSS'
+
+        col.separator(factor=0.5)
+        col.label(text="Controller Color")
+
+        row = col.row(align=True)
+        row.enabled = is_pose_mode
+        row.prop(scene, "kt_rig_controller_color", text="")
+        row.operator(
+            "kt.apply_controller_color",
+            text="Apply",
+            icon='COLOR'
+        )
+
+        if not is_pose_mode:
+            col.label(text="Select bones in Pose Mode", icon='INFO')
+
+
 class VIEW3D_PT_info_panel(bpy.types.Panel):
     bl_label = "Info"
     bl_idname = "VIEW3D_PT_info_panel"
@@ -1850,11 +2261,11 @@ class VIEW3D_PT_info_panel(bpy.types.Panel):
         col2 = box.column(align=True)
 
         col2.label(
-            text="USE ORIGIN",
-            icon='OBJECT_ORIGIN'
+            text="USE SEL ORIENTED",
+            icon='ORIENTATION_CURSOR'
         )
         col2.label(text="Tool: Transform")
-        col2.label(text="Orientation: Cursor")
+        col2.label(text="Selection oriented by 3D Cursor")
         col2.label(text="Pivot: Active Element")
 
         box.separator()
@@ -1923,6 +2334,20 @@ class VIEW3D_PT_info_panel(bpy.types.Panel):
         col2.label(text="Rotation: 0, 0, 0")
 
         # ------------------------------------------------------------
+        # RIG TOOLS
+        # ------------------------------------------------------------
+
+        box = col.box()
+        row = box.row()
+        row.label(text="RIG TOOLS", icon='BONE_DATA')
+        box.separator(factor=0.3)
+
+        col2 = box.column(align=True)
+        col2.label(text="Pose Mode: selected bones")
+        col2.label(text="Create Controller → Circle Custom Shape")
+        col2.label(text="Shape presets + custom controller color")
+
+        # ------------------------------------------------------------
         # AUTHOR
         # ------------------------------------------------------------
 
@@ -1958,6 +2383,7 @@ classes = (
     VIEW3D_PT_viewport_tools,
     VIEW3D_PT_material_tools,
     VIEW3D_PT_modeling_tools,
+    VIEW3D_PT_rig_tools,
     VIEW3D_PT_info_panel,
     CT_OT_enable_dynamic_bg,
     CT_OT_set_active_object_color,
@@ -1966,6 +2392,9 @@ classes = (
     KT_OT_remove_material_from_selected,
     KT_OT_quadrangulate_loop,
     KT_OT_circularize_loop,
+    KT_OT_create_controllers,
+    KT_OT_set_controller_shape,
+    KT_OT_apply_controller_color,
     KT_OT_update_addon,
 )
 
@@ -2041,6 +2470,16 @@ def register():
         name="Remove Material from Selected",
         default=False,
     )
+
+    bpy.types.Scene.kt_rig_controller_color = bpy.props.FloatVectorProperty(
+        name="Controller Color",
+        description="Custom color applied to selected pose-bone controllers",
+        subtype='COLOR',
+        size=3,
+        min=0.0,
+        max=1.0,
+        default=(0.12, 0.55, 1.0),
+    )
     
     if viewport_mode_handler not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(viewport_mode_handler)
@@ -2071,6 +2510,9 @@ def unregister():
 
     if hasattr(bpy.types.Scene, "kt_remove_material_expanded"):
         del bpy.types.Scene.kt_remove_material_expanded
+
+    if hasattr(bpy.types.Scene, "kt_rig_controller_color"):
+        del bpy.types.Scene.kt_rig_controller_color
 
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
