@@ -2,7 +2,7 @@
 bl_info = {
     "name": "KustomTools",
     "author": "Álvaro_A",
-    "version": (1, 9, 1),
+    "version": (1, 9, 3),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Kustom Tools",
     "description": "Orient Cursor tools and basic color settings to improve experience",
@@ -1862,11 +1862,16 @@ def kt_create_controller_bones(context, source_pose_bones):
         created_controllers.append(controller_pose)
 
     # Select the new controllers so the animator can use them immediately.
-    for data_bone in armature_obj.data.bones:
-        data_bone.select = False
+    # Blender 5.2 moved Pose Mode selection to PoseBone.select; Bone.select
+    # no longer exists on bpy.types.Bone.
+    try:
+        bpy.ops.pose.select_all(action='DESELECT')
+    except Exception:
+        for pose_bone in armature_obj.pose.bones:
+            pose_bone.select = False
 
     for controller_pose in created_controllers:
-        controller_pose.bone.select = True
+        controller_pose.select = True
 
     if created_controllers:
         armature_obj.data.bones.active = created_controllers[-1].bone
@@ -1920,6 +1925,117 @@ class KT_OT_create_controllers(bpy.types.Operator):
             {'INFO'},
             f"Created {len(controllers)} controller bone"
             f"{'s' if len(controllers) != 1 else ''}"
+        )
+        return {'FINISHED'}
+
+
+class KT_OT_delete_controllers(bpy.types.Operator):
+    bl_idname = "kt.delete_controllers"
+    bl_label = "Delete Controller"
+    bl_description = (
+        "Delete the selected KustomTools controller bones and restore the "
+        "original bones without deleting the rig bones they control"
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return (
+            context.mode == 'POSE'
+            and obj is not None
+            and obj.type == 'ARMATURE'
+        )
+
+    def execute(self, context):
+        armature_obj = context.active_object
+        controller_bones = kt_resolve_controller_pose_bones(context)
+
+        if not controller_bones:
+            self.report(
+                {'WARNING'},
+                "Select a controller bone or an original bone with a controller"
+            )
+            return {'CANCELLED'}
+
+        controller_names = {bone.name for bone in controller_bones}
+        source_names = []
+        controller_to_source = {}
+
+        # Remove the driving constraints and links before deleting the
+        # controller bones. The original bones are never deleted.
+        for controller_pose in controller_bones:
+            source_name = controller_pose.get("kt_source_bone")
+            if not source_name:
+                continue
+
+            controller_to_source[controller_pose.name] = source_name
+            if source_name not in source_names:
+                source_names.append(source_name)
+
+            source_pose = armature_obj.pose.bones.get(source_name)
+            if source_pose is None:
+                continue
+
+            constraint = source_pose.constraints.get(KT_CONTROLLER_CONSTRAINT)
+            if constraint is not None:
+                source_pose.constraints.remove(constraint)
+
+            if source_pose.get("kt_controller_bone") == controller_pose.name:
+                try:
+                    del source_pose["kt_controller_bone"]
+                except Exception:
+                    pass
+
+        bpy.ops.object.mode_set(mode='EDIT')
+        edit_bones = armature_obj.data.edit_bones
+
+        # If a remaining controller was parented to a controller being deleted,
+        # parent it to the restored source bone instead. This preserves the
+        # original rig hierarchy without creating dependency cycles.
+        for controller_name in list(controller_names):
+            controller_edit = edit_bones.get(controller_name)
+            if controller_edit is None:
+                continue
+
+            source_name = controller_to_source.get(controller_name)
+            fallback_parent = edit_bones.get(source_name) if source_name else None
+
+            for child in list(controller_edit.children):
+                if child.name not in controller_names:
+                    child.parent = fallback_parent or controller_edit.parent
+                    child.use_connect = False
+
+        deleted_count = 0
+        for controller_name in list(controller_names):
+            controller_edit = edit_bones.get(controller_name)
+            if controller_edit is not None:
+                edit_bones.remove(controller_edit)
+                deleted_count += 1
+
+        bpy.ops.object.mode_set(mode='POSE')
+
+        # Blender 5.2 stores Pose Mode selection on PoseBone.select.
+        try:
+            bpy.ops.pose.select_all(action='DESELECT')
+        except Exception:
+            for pose_bone in armature_obj.pose.bones:
+                pose_bone.select = False
+
+        restored_bones = []
+        for source_name in source_names:
+            source_pose = armature_obj.pose.bones.get(source_name)
+            if source_pose is not None:
+                source_pose.select = True
+                restored_bones.append(source_pose)
+
+        if restored_bones:
+            armature_obj.data.bones.active = restored_bones[-1].bone
+
+        self.report(
+            {'INFO'},
+            f"Deleted {deleted_count} controller bone"
+            f"{'s' if deleted_count != 1 else ''}"
         )
         return {'FINISHED'}
 
@@ -2350,6 +2466,14 @@ class VIEW3D_PT_rig_tools(bpy.types.Panel):
             icon='BONE_DATA'
         )
 
+        row = col.row(align=True)
+        row.enabled = is_pose_mode
+        row.operator(
+            "kt.delete_controllers",
+            text="Delete Controller",
+            icon='TRASH'
+        )
+
         col.separator(factor=0.5)
         col.label(text="Shape Presets")
 
@@ -2577,6 +2701,7 @@ class VIEW3D_PT_info_panel(bpy.types.Panel):
         col2 = box.column(align=True)
         col2.label(text="Pose Mode: selected bones")
         col2.label(text="Create Controller → separate control bone")
+        col2.label(text="Delete Controller → restore original bone")
         col2.label(text="Original bone stays visible")
         col2.label(text="Shape centered at bone origin/head")
         col2.label(text="Shape presets + custom controller color")
@@ -2627,6 +2752,7 @@ classes = (
     KT_OT_quadrangulate_loop,
     KT_OT_circularize_loop,
     KT_OT_create_controllers,
+    KT_OT_delete_controllers,
     KT_OT_set_controller_shape,
     KT_OT_apply_controller_color,
     KT_OT_update_addon,
