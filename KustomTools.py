@@ -2,7 +2,7 @@
 bl_info = {
     "name": "KustomTools",
     "author": "Álvaro_A",
-    "version": (1, 5, 0),
+    "version": (1, 6, 0),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Kustom Tools",
     "description": "Orient Cursor tools and basic color settings to improve experience",
@@ -13,6 +13,7 @@ import bpy
 import bmesh
 import urllib.request
 import os
+import math
 from mathutils import Vector
 from mathutils.bvhtree import BVHTree
 from bpy_extras import view3d_utils
@@ -790,6 +791,12 @@ class KT_OT_delete_unused_materials(bpy.types.Operator):
         ):
             context.scene.kt_material_name = ""
 
+        if (
+            context.scene.kt_remove_material_name
+            and bpy.data.materials.get(context.scene.kt_remove_material_name) is None
+        ):
+            context.scene.kt_remove_material_name = ""
+
         self.report(
             {'INFO'},
             f"Deleted {count} unused material{'s' if count != 1 else ''}"
@@ -900,6 +907,81 @@ class KT_OT_select_by_material(bpy.types.Operator):
 
         self.report({'WARNING'}, "Use this tool in Object Mode or Mesh Edit Mode")
         return {'CANCELLED'}
+
+
+class KT_OT_remove_material_from_selected(bpy.types.Operator):
+    bl_idname = "kt.remove_material_from_selected"
+    bl_label = "Remove Material from Selected"
+    bl_description = "Remove the chosen material slot from all selected mesh objects"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == 'OBJECT'
+
+    def execute(self, context):
+        material_name = context.scene.kt_remove_material_name.strip()
+        material = bpy.data.materials.get(material_name)
+
+        if material is None:
+            self.report({'WARNING'}, "Choose a valid material first")
+            return {'CANCELLED'}
+
+        selected_meshes = [
+            obj for obj in context.selected_objects
+            if obj.type == 'MESH'
+        ]
+
+        if not selected_meshes:
+            self.report({'WARNING'}, "Select at least one mesh object")
+            return {'CANCELLED'}
+
+        affected_objects = 0
+        removed_slots = 0
+        processed_mesh_data = set()
+
+        for obj in selected_meshes:
+            matching_indices = [
+                index for index, slot in enumerate(obj.material_slots)
+                if slot.material == material
+            ]
+
+            if not matching_indices:
+                continue
+
+            affected_objects += 1
+
+            # Material slot lists belong to the Mesh datablock. Avoid removing
+            # the same slots twice when selected objects share mesh data.
+            mesh_key = obj.data.as_pointer()
+            if mesh_key in processed_mesh_data:
+                continue
+
+            processed_mesh_data.add(mesh_key)
+
+            for index in reversed(matching_indices):
+                obj.data.materials.pop(index=index)
+                removed_slots += 1
+
+        if affected_objects == 0:
+            self.report(
+                {'INFO'},
+                f"{material.name} is not assigned to the selected objects"
+            )
+            return {'FINISHED'}
+
+        self.report(
+            {'INFO'},
+            f"Removed {material.name} from {affected_objects} selected object"
+            f"{'s' if affected_objects != 1 else ''}"
+        )
+
+        print(
+            f"KustomTools - Removed {removed_slots} slot"
+            f"{'s' if removed_slots != 1 else ''} for material {material.name}"
+        )
+
+        return {'FINISHED'}
 
 
 # ------------------------------------------------------------
@@ -1136,6 +1218,137 @@ class KT_OT_quadrangulate_loop(bpy.types.Operator):
 
         return {'FINISHED'}
 
+class KT_OT_circularize_loop(bpy.types.Operator):
+    bl_idname = "kt.circularize_loop"
+    bl_label = "Circularize"
+    bl_description = (
+        "Reshape one selected closed edge loop into an evenly spaced circle "
+        "on its closest world axis plane"
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.edit_object
+        return (
+            context.mode == 'EDIT_MESH'
+            and obj is not None
+            and obj.type == 'MESH'
+        )
+
+    def execute(self, context):
+        obj = context.edit_object
+        bm = bmesh.from_edit_mesh(obj.data)
+
+        bm.verts.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+
+        selected_edges = [edge for edge in bm.edges if edge.select]
+
+        if not selected_edges:
+            self.report({'WARNING'}, "Select one complete closed edge loop")
+            return {'CANCELLED'}
+
+        try:
+            vertices = kt_get_ordered_edge_loop(selected_edges)
+        except RuntimeError as error:
+            self.report({'WARNING'}, str(error))
+            return {'CANCELLED'}
+
+        vertex_count = len(vertices)
+        if vertex_count < 3:
+            self.report({'WARNING'}, "The loop needs at least 3 edges")
+            return {'CANCELLED'}
+
+        matrix_world = obj.matrix_world
+        matrix_world_inv = matrix_world.inverted()
+
+        def world_position(vert):
+            return matrix_world @ vert.co
+
+        positions = [world_position(vert) for vert in vertices]
+        normal_axis, axis_u, axis_v = kt_detect_axis_plane(positions)
+
+        center = Vector((0.0, 0.0, 0.0))
+        for pos in positions:
+            center += pos
+        center /= vertex_count
+
+        u_values = [pos[axis_u] for pos in positions]
+        v_values = [pos[axis_v] for pos in positions]
+
+        half_u = (max(u_values) - min(u_values)) * 0.5
+        half_v = (max(v_values) - min(v_values)) * 0.5
+        radius = (half_u + half_v) * 0.5
+
+        if radius <= 1.0e-8:
+            self.report({'WARNING'}, "Selected loop is too small or degenerate")
+            return {'CANCELLED'}
+
+        # Pick a stable starting vertex close to the +U side of the loop.
+        target_u = center[axis_u] + radius
+        target_v = center[axis_v]
+        best_index = 0
+        best_distance = None
+
+        for index, pos in enumerate(positions):
+            du = pos[axis_u] - target_u
+            dv = pos[axis_v] - target_v
+            distance = du * du + dv * dv
+
+            if best_distance is None or distance < best_distance:
+                best_distance = distance
+                best_index = index
+
+        vertices = kt_rotate_list(vertices, best_index)
+
+        p0 = world_position(vertices[0])
+        start_angle = math.atan2(
+            p0[axis_v] - center[axis_v],
+            p0[axis_u] - center[axis_u],
+        )
+
+        direction = 1.0
+        if vertex_count > 1:
+            p1 = world_position(vertices[1])
+            second_angle = math.atan2(
+                p1[axis_v] - center[axis_v],
+                p1[axis_u] - center[axis_u],
+            )
+            delta = (second_angle - start_angle + math.pi) % (2.0 * math.pi) - math.pi
+            if delta < 0.0:
+                direction = -1.0
+
+        angle_step = direction * (2.0 * math.pi / float(vertex_count))
+
+        for index, vert in enumerate(vertices):
+            angle = start_angle + angle_step * index
+            original_world = world_position(vert)
+            new_world = center.copy()
+
+            # Preserve depth perpendicular to the detected axis plane.
+            new_world[normal_axis] = original_world[normal_axis]
+            new_world[axis_u] = center[axis_u] + math.cos(angle) * radius
+            new_world[axis_v] = center[axis_v] + math.sin(angle) * radius
+
+            vert.co = matrix_world_inv @ new_world
+
+        bmesh.update_edit_mesh(
+            obj.data,
+            loop_triangles=False,
+            destructive=False,
+        )
+
+        axis_names = ["X", "Y", "Z"]
+        plane_name = axis_names[axis_u] + axis_names[axis_v]
+        self.report(
+            {'INFO'},
+            f"Circularized {vertex_count} edges on {plane_name}"
+        )
+
+        return {'FINISHED'}
+
+
 # ------------------------------------------------------------
 # Keymap
 # ------------------------------------------------------------
@@ -1334,39 +1547,77 @@ class VIEW3D_PT_material_tools(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         scene = context.scene
-
         col = layout.column(align=True)
 
-        # Material selector and contextual selection button
+        # --------------------------------------------------------
+        # SELECT BY MATERIAL - COLLAPSIBLE
+        # --------------------------------------------------------
         box = col.box()
-        box.label(text="Select by Material", icon='MATERIAL')
-        box.prop_search(
-            scene,
-            "kt_material_name",
-            bpy.data,
-            "materials",
-            text="Material"
-        )
-
-        if context.mode == 'EDIT_MESH':
-            button_text = "Select Faces"
-            button_icon = 'FACESEL'
-        else:
-            button_text = "Select Objects"
-            button_icon = 'RESTRICT_SELECT_OFF'
-
         row = box.row(align=True)
-        row.enabled = context.mode in {'OBJECT', 'EDIT_MESH'}
-        row.operator(
-            "kt.select_by_material",
-            text=button_text,
-            icon=button_icon
+        row.prop(
+            scene,
+            "kt_select_material_expanded",
+            text="Select by Material",
+            icon='TRIA_DOWN' if scene.kt_select_material_expanded else 'TRIA_RIGHT',
+            emboss=False,
         )
 
-        # Unused material cleanup
+        if scene.kt_select_material_expanded:
+            box.prop_search(
+                scene,
+                "kt_material_name",
+                bpy.data,
+                "materials",
+                text="Material"
+            )
+
+            if context.mode == 'EDIT_MESH':
+                button_text = "Select Faces"
+                button_icon = 'FACESEL'
+            else:
+                button_text = "Select Objects"
+                button_icon = 'RESTRICT_SELECT_OFF'
+
+            row = box.row(align=True)
+            row.enabled = context.mode in {'OBJECT', 'EDIT_MESH'}
+            row.operator(
+                "kt.select_by_material",
+                text=button_text,
+                icon=button_icon
+            )
+
+        # --------------------------------------------------------
+        # REMOVE MATERIAL FROM SELECTED - COLLAPSIBLE
+        # --------------------------------------------------------
         box = col.box()
-        box.label(text="Cleanup", icon='BRUSH_DATA')
-        box.operator(
+        row = box.row(align=True)
+        row.prop(
+            scene,
+            "kt_remove_material_expanded",
+            text="Remove Material from Selected",
+            icon='TRIA_DOWN' if scene.kt_remove_material_expanded else 'TRIA_RIGHT',
+            emboss=False,
+        )
+
+        if scene.kt_remove_material_expanded:
+            box.prop_search(
+                scene,
+                "kt_remove_material_name",
+                bpy.data,
+                "materials",
+                text="Material"
+            )
+
+            row = box.row(align=True)
+            row.enabled = context.mode == 'OBJECT'
+            row.operator(
+                "kt.remove_material_from_selected",
+                text="Remove Material",
+                icon='X'
+            )
+
+        # Cleanup stays intentionally minimal.
+        col.operator(
             "kt.delete_unused_materials",
             text="Delete Unused Materials",
             icon='TRASH'
@@ -1392,12 +1643,15 @@ class VIEW3D_PT_modeling_tools(bpy.types.Panel):
         row.enabled = context.mode == 'EDIT_MESH'
         row.operator(
             "kt.quadrangulate_loop",
-            text="Quadrangulate Loop",
+            text="Quadrangulate",
             icon='MESH_GRID'
         )
+        row.operator(
+            "kt.circularize_loop",
+            text="Circularize",
+            icon='MESH_CIRCLE'
+        )
 
-        if context.mode != 'EDIT_MESH':
-            box.label(text="Select a closed loop in Edit Mode", icon='INFO')
 
 class VIEW3D_PT_info_panel(bpy.types.Panel):
     bl_label = "Info"
@@ -1669,7 +1923,9 @@ classes = (
     CT_OT_set_active_object_color,
     KT_OT_delete_unused_materials,
     KT_OT_select_by_material,
+    KT_OT_remove_material_from_selected,
     KT_OT_quadrangulate_loop,
+    KT_OT_circularize_loop,
     KT_OT_update_addon,
 )
 
@@ -1726,8 +1982,24 @@ def register():
 
     bpy.types.Scene.kt_material_name = bpy.props.StringProperty(
         name="Material",
-        description="Material used by Material Tools",
+        description="Material used by Select by Material",
         default="",
+    )
+
+    bpy.types.Scene.kt_remove_material_name = bpy.props.StringProperty(
+        name="Material",
+        description="Material to remove from selected objects",
+        default="",
+    )
+
+    bpy.types.Scene.kt_select_material_expanded = bpy.props.BoolProperty(
+        name="Select by Material",
+        default=False,
+    )
+
+    bpy.types.Scene.kt_remove_material_expanded = bpy.props.BoolProperty(
+        name="Remove Material from Selected",
+        default=False,
     )
     
     if viewport_mode_handler not in bpy.app.handlers.depsgraph_update_post:
@@ -1750,6 +2022,15 @@ def unregister():
 
     if hasattr(bpy.types.Scene, "kt_material_name"):
         del bpy.types.Scene.kt_material_name
+
+    if hasattr(bpy.types.Scene, "kt_remove_material_name"):
+        del bpy.types.Scene.kt_remove_material_name
+
+    if hasattr(bpy.types.Scene, "kt_select_material_expanded"):
+        del bpy.types.Scene.kt_select_material_expanded
+
+    if hasattr(bpy.types.Scene, "kt_remove_material_expanded"):
+        del bpy.types.Scene.kt_remove_material_expanded
 
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
