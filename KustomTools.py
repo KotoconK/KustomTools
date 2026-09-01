@@ -2,7 +2,7 @@
 bl_info = {
     "name": "KustomTools",
     "author": "Álvaro_A",
-    "version": (1, 9, 5),
+    "version": (1, 9, 6),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Kustom Tools",
     "description": "Orient Cursor tools and basic color settings to improve experience",
@@ -1441,266 +1441,8 @@ class KT_OT_circularize_loop(bpy.types.Operator):
         return {'FINISHED'}
 
 
-class KT_OT_select_flipped_faces(bpy.types.Operator):
-    bl_idname = "kt.select_flipped_faces"
-    bl_label = "Select Flipped Faces"
-    bl_description = (
-        "Use one selected inverted face as reference and select equivalent "
-        "flipped faces across disconnected parts of the active mesh"
-    )
-    bl_options = {'REGISTER', 'UNDO'}
-
-    @classmethod
-    def poll(cls, context):
-        obj = context.edit_object
-        return (
-            context.mode == 'EDIT_MESH'
-            and obj is not None
-            and obj.type == 'MESH'
-        )
-
-    def execute(self, context):
-        obj = context.edit_object
-        bm = bmesh.from_edit_mesh(obj.data)
-
-        bm.verts.ensure_lookup_table()
-        bm.edges.ensure_lookup_table()
-        bm.faces.ensure_lookup_table()
-
-        selected_faces = [face for face in bm.faces if face.select]
-
-        if len(selected_faces) != 1:
-            self.report({'WARNING'}, "Select exactly 1 inverted face")
-            return {'CANCELLED'}
-
-        reference_face = selected_faces[0]
-
-        # Build adjacency together with winding compatibility. Two correctly
-        # oriented neighbouring faces traverse their shared edge in opposite
-        # directions. A matching direction means the winding parity changes.
-        edge_faces = {}
-
-        for face in bm.faces:
-            for loop in face.loops:
-                edge_faces.setdefault(loop.edge, []).append(
-                    (
-                        face,
-                        loop.vert,
-                        loop.link_loop_next.vert,
-                    )
-                )
-
-        adjacency = {face: [] for face in bm.faces}
-
-        for entries in edge_faces.values():
-            if len(entries) != 2:
-                # Match the Maya tool: only ordinary manifold shared edges are
-                # used to propagate winding between neighbouring faces.
-                continue
-
-            face_a, a1, a2 = entries[0]
-            face_b, b1, b2 = entries[1]
-
-            opposite_direction = (
-                a1 is b2
-                and a2 is b1
-            )
-
-            toggle = 0 if opposite_direction else 1
-            adjacency[face_a].append((face_b, toggle))
-            adjacency[face_b].append((face_a, toggle))
-
-        # Find every disconnected face shell in the active mesh.
-        shells = []
-        unvisited = set(bm.faces)
-
-        while unvisited:
-            seed = next(iter(unvisited))
-            shell = set()
-            queue = [seed]
-
-            while queue:
-                face = queue.pop()
-
-                if face in shell:
-                    continue
-
-                shell.add(face)
-                unvisited.discard(face)
-
-                for neighbour, _toggle in adjacency[face]:
-                    if neighbour not in shell:
-                        queue.append(neighbour)
-
-            shells.append(shell)
-
-        # Resolve the two possible winding-parity groups for every shell.
-        shell_orientations = []
-
-        for shell in shells:
-            seed = next(iter(shell))
-            orientation = {seed: 0}
-            queue = [seed]
-
-            while queue:
-                current = queue.pop()
-
-                for neighbour, toggle in adjacency[current]:
-                    if neighbour not in shell:
-                        continue
-
-                    neighbour_orientation = orientation[current] ^ toggle
-
-                    if neighbour not in orientation:
-                        orientation[neighbour] = neighbour_orientation
-                        queue.append(neighbour)
-
-            shell_orientations.append(orientation)
-
-        reference_orientation = None
-        reference_data = None
-
-        for orientation in shell_orientations:
-            if reference_face in orientation:
-                reference_orientation = orientation[reference_face]
-                reference_data = orientation
-                break
-
-        if reference_data is None:
-            self.report({'WARNING'}, "Could not resolve the reference face")
-            return {'CANCELLED'}
-
-        ref_group_0 = [
-            face for face, value in reference_data.items()
-            if value == 0
-        ]
-        ref_group_1 = [
-            face for face, value in reference_data.items()
-            if value == 1
-        ]
-
-        if reference_orientation == 0:
-            reference_is_minority = len(ref_group_0) <= len(ref_group_1)
-        else:
-            reference_is_minority = len(ref_group_1) <= len(ref_group_0)
-
-        faces_to_select = []
-
-        for orientation in shell_orientations:
-            group_0 = [
-                face for face, value in orientation.items()
-                if value == 0
-            ]
-            group_1 = [
-                face for face, value in orientation.items()
-                if value == 1
-            ]
-
-            # A shell with only one winding group is internally consistent.
-            # Without a topological connection to the reference shell there is
-            # no reliable way to decide whether that whole shell is reversed.
-            if not group_0 or not group_1:
-                continue
-
-            if reference_is_minority:
-                target_group = (
-                    group_0
-                    if len(group_0) <= len(group_1)
-                    else group_1
-                )
-            else:
-                target_group = (
-                    group_0
-                    if len(group_0) >= len(group_1)
-                    else group_1
-                )
-
-            faces_to_select.extend(target_group)
-
-        if reference_face not in faces_to_select:
-            faces_to_select.append(reference_face)
-
-        faces_to_select = list(set(faces_to_select))
-
-        # Replace the current selection with the detected faces.
-        for face in bm.faces:
-            face.select = False
-        for edge in bm.edges:
-            edge.select = False
-        for vert in bm.verts:
-            vert.select = False
-
-        for face in faces_to_select:
-            face.select = True
-
-        context.tool_settings.mesh_select_mode = (False, False, True)
-        bm.select_mode = {'FACE'}
-        bm.select_flush_mode()
-
-        bmesh.update_edit_mesh(
-            obj.data,
-            loop_triangles=False,
-            destructive=False,
-        )
-
-        self.report(
-            {'INFO'},
-            f"Selected {len(faces_to_select)} flipped face"
-            f"{'s' if len(faces_to_select) != 1 else ''} across "
-            f"{len(shells)} shell{'s' if len(shells) != 1 else ''}"
-        )
-        return {'FINISHED'}
-
-
-class KT_OT_reverse_selected_faces(bpy.types.Operator):
-    bl_idname = "kt.reverse_selected_faces"
-    bl_label = "Reverse Selected Faces"
-    bl_description = "Reverse the winding and normals of the currently selected faces"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    @classmethod
-    def poll(cls, context):
-        obj = context.edit_object
-        return (
-            context.mode == 'EDIT_MESH'
-            and obj is not None
-            and obj.type == 'MESH'
-        )
-
-    def execute(self, context):
-        obj = context.edit_object
-        bm = bmesh.from_edit_mesh(obj.data)
-        bm.faces.ensure_lookup_table()
-
-        selected_faces = [face for face in bm.faces if face.select]
-
-        if not selected_faces:
-            self.report({'WARNING'}, "No faces selected")
-            return {'CANCELLED'}
-
-        bmesh.ops.reverse_faces(
-            bm,
-            faces=selected_faces,
-            flip_multires=False,
-        )
-        bm.normal_update()
-
-        bmesh.update_edit_mesh(
-            obj.data,
-            loop_triangles=True,
-            destructive=False,
-        )
-
-        self.report(
-            {'INFO'},
-            f"Reversed {len(selected_faces)} face"
-            f"{'s' if len(selected_faces) != 1 else ''}"
-        )
-        return {'FINISHED'}
-
-
 # ------------------------------------------------------------
-# RIG TOOLS
+# ANI / RIG TOOLS
 # ------------------------------------------------------------
 
 KT_RIG_SHAPE_COLLECTION = "KustomTools_RigShapes"
@@ -2427,6 +2169,44 @@ class KT_OT_apply_controller_color(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class KT_OT_clean_actions(bpy.types.Operator):
+    bl_idname = "kt.clean_actions"
+    bl_label = "Clean Actions"
+    bl_description = (
+        "Delete every Action in the entire .blend file that does not have "
+        "Fake User enabled"
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def draw(self, context):
+        layout = self.layout
+        layout.label(
+            text="This deletes ALL Actions without Fake User.",
+            icon='ERROR'
+        )
+        layout.label(text="The cleanup affects the entire .blend file.")
+        layout.label(text="Assigned and NLA Actions are deleted too if Fake User is OFF.")
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=440)
+
+    def execute(self, context):
+        actions_to_delete = [
+            action for action in list(bpy.data.actions)
+            if not action.use_fake_user
+        ]
+
+        for action in actions_to_delete:
+            bpy.data.actions.remove(action, do_unlink=True)
+
+        count = len(actions_to_delete)
+        self.report(
+            {'INFO'},
+            f"Deleted {count} Action{'s' if count != 1 else ''} without Fake User"
+        )
+        return {'FINISHED'}
+
+
 # ------------------------------------------------------------
 # Keymap
 # ------------------------------------------------------------
@@ -2731,25 +2511,9 @@ class VIEW3D_PT_modeling_tools(bpy.types.Panel):
             icon='MESH_CIRCLE'
         )
 
-        box = layout.box()
-        box.label(text="Select 1 inverted face", icon='FACESEL')
-
-        row = box.row(align=True)
-        row.enabled = context.mode == 'EDIT_MESH'
-        row.operator(
-            "kt.select_flipped_faces",
-            text="Apply",
-            icon='CHECKMARK'
-        )
-        row.operator(
-            "kt.reverse_selected_faces",
-            text="Reverse",
-            icon='FILE_REFRESH'
-        )
-
 
 class VIEW3D_PT_rig_tools(bpy.types.Panel):
-    bl_label = "Rig Tools"
+    bl_label = "Ani/Rig Tools"
     bl_idname = "VIEW3D_PT_rig_tools"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
@@ -2806,6 +2570,13 @@ class VIEW3D_PT_rig_tools(bpy.types.Panel):
             icon='COLOR'
         )
 
+        col.separator(factor=0.7)
+        col.operator(
+            "kt.clean_actions",
+            text="Clean Actions",
+            icon='TRASH'
+        )
+
         if not is_pose_mode:
             col.label(text="Select bones in Pose Mode", icon='INFO')
 
@@ -2819,212 +2590,40 @@ class VIEW3D_PT_info_panel(bpy.types.Panel):
     bl_options = {'DEFAULT_CLOSED'}
 
     def draw(self, context):
-
         layout = self.layout
         col = layout.column(align=True)
         version_str = ".".join(map(str, ADDON_VERSION))
 
-        # ------------------------------------------------------------
         # VERSION / UPDATE
-        # ------------------------------------------------------------
-
         box = col.box()
-
-        row = box.row()
-        row.label(
+        box.label(
             text=f"KUSTOMTOOLS {version_str}",
             icon='BLENDER'
         )
-
         box.separator(factor=0.3)
-
         box.operator(
             "kt.update_addon",
             text="Check Update",
             icon='IMPORT'
         )
 
-        # ------------------------------------------------------------
-        # GLOBAL SHORTCUT
-        # ------------------------------------------------------------
-
+        # EDIT 3D CURSOR SHORTCUT
         box = col.box()
-
-        row = box.row()
-        row.label(
-            text="GLOBAL SHORTCUT",
-            icon='MOUSE_MMB'
-        )
-
-        box.separator(factor=0.3)
-
-        col2 = box.column(align=True)
-
-        col2.label(text="Alt + Shift + MMB")
-        col2.label(text="Context sensitive")
-
-        # ------------------------------------------------------------
-        # TOOLS
-        # ------------------------------------------------------------
-
-        box = col.box()
-
-        row = box.row()
-        row.label(
-            text="TOOLS",
-            icon='TOOL_SETTINGS'
-        )
-
-        box.separator(factor=0.3)
-
-        col2 = box.column(align=True)
-
-        col2.label(
-            text="EDIT PIVOT",
-            icon='PIVOT_INDIVIDUAL'
-        )
-        col2.label(text="Object Mode")
-        col2.label(text="Affect Only Origins")
-        col2.label(text="Snap: Vertex / Edge / Face")
-        col2.label(text="Alt+Shift+MMB → Face Align")
-
-        box.separator()
-
-        col2 = box.column(align=True)
-
-        col2.label(
+        box.label(
             text="EDIT 3D CURSOR",
             icon='CURSOR'
         )
-        col2.label(text="Edit Mode")
-        col2.label(text="Tool: 3D Cursor")
-        col2.label(text="Snap: Vertex / Closest")
-        col2.label(text="Alt+Shift+MMB → Face Align")
-
-        # ------------------------------------------------------------
-        # ORIGIN TOOLS
-        # ------------------------------------------------------------
-
-        box = col.box()
-
-        row = box.row()
-        row.label(
-            text="ORIGIN TOOLS",
-            icon='OBJECT_ORIGIN'
-        )
-
         box.separator(factor=0.3)
+        box.label(text="Alt + Shift + MMB → Face Align")
 
-        col2 = box.column(align=True)
-
-        col2.label(
-            text="USE SEL ORIENTED",
-            icon='ORIENTATION_CURSOR'
-        )
-        col2.label(text="Tool: Transform")
-        col2.label(text="Selection oriented by 3D Cursor")
-        col2.label(text="Pivot: Active Element")
-
-        box.separator()
-
-        col2 = box.column(align=True)
-
-        col2.label(
-            text="ORIGIN TO GEOMETRY",
-            icon='MESH_CUBE'
-        )
-        col2.label(text="Set origin to geometry")
-
-        # ------------------------------------------------------------
-        # CURSOR TOOLS
-        # ------------------------------------------------------------
-
-        box = col.box()
-
-        row = box.row()
-        row.label(
-            text="CURSOR TOOLS",
-            icon='CURSOR'
-        )
-
-        box.separator(factor=0.3)
-
-        col2 = box.column(align=True)
-
-        col2.label(
-            text="USE CURSOR",
-            icon='PIVOT_CURSOR'
-        )
-        col2.label(text="Tool: Transform")
-        col2.label(text="Pivot: 3D Cursor")
-        col2.label(text="Snap: OFF")
-
-        # ------------------------------------------------------------
-        # USE SELECTION / RESET 3D CURSOR
-        # ------------------------------------------------------------
-
-        box = col.box()
-
-        row = box.row()
-        row.label(
-            text="USE SELECTION",
-            icon='FACESEL'
-        )
-
-        box.separator(factor=0.3)
-
-        col2 = box.column(align=True)
-        col2.label(text="Tool: Transform")
-        col2.label(text="Orientation: Normal")
-        col2.label(text="Pivot: Active Element")
-        col2.label(text="Snap: OFF")
-        col2.label(text="Origins: OFF")
-
-        box.separator()
-
-        col2 = box.column(align=True)
-        col2.label(
-            text="RESET 3D CURSOR",
-            icon='LOOP_BACK'
-        )
-        col2.label(text="Location: 0, 0, 0")
-        col2.label(text="Rotation: 0, 0, 0")
-
-        # ------------------------------------------------------------
-        # RIG TOOLS
-        # ------------------------------------------------------------
-
-        box = col.box()
-        row = box.row()
-        row.label(text="RIG TOOLS", icon='BONE_DATA')
-        box.separator(factor=0.3)
-
-        col2 = box.column(align=True)
-        col2.label(text="Pose Mode: selected bones")
-        col2.label(text="Create Controller → separate control bone")
-        col2.label(text="Delete Controller → restore original bone")
-        col2.label(text="Original bone stays visible")
-        col2.label(text="Shape centered at bone origin/head")
-        col2.label(text="Shape dropdown auto-applies to selected CTRL")
-        col2.label(text="Color changes only selected CTRL bones")
-
-        # ------------------------------------------------------------
         # AUTHOR
-        # ------------------------------------------------------------
-
         box = col.box()
-
-        row = box.row()
-        row.label(
+        box.label(
             text="AUTHOR",
             icon='INFO'
         )
-
         box.separator(factor=0.3)
-
-        col2 = box.column(align=True)
-
-        col2.label(text="Developed by Álvaro_A")
+        box.label(text="Developed by Álvaro_A")
 
 # ------------------------------------------------------------
 # Register
@@ -3053,12 +2652,11 @@ classes = (
     KT_OT_remove_material_from_selected,
     KT_OT_quadrangulate_loop,
     KT_OT_circularize_loop,
-    KT_OT_select_flipped_faces,
-    KT_OT_reverse_selected_faces,
     KT_OT_create_controllers,
     KT_OT_delete_controllers,
     KT_OT_set_controller_shape,
     KT_OT_apply_controller_color,
+    KT_OT_clean_actions,
     KT_OT_update_addon,
 )
 
