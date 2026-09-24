@@ -2,7 +2,7 @@
 bl_info = {
     "name": "KustomTools",
     "author": "Álvaro_A",
-    "version": (1, 9, 6),
+    "version": (1, 9, 7),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Kustom Tools",
     "description": "Orient Cursor tools and basic color settings to improve experience",
@@ -2169,6 +2169,195 @@ class KT_OT_apply_controller_color(bpy.types.Operator):
         return {'FINISHED'}
 
 
+# ------------------------------------------------------------
+# FUSIONAR HUESOS
+# ------------------------------------------------------------
+
+def kt_merge_armature_from_context(context):
+    obj = context.object
+    if obj and obj.type == 'ARMATURE':
+        return obj
+    return None
+
+
+def kt_merge_get_edit_bone(arm, name):
+    if not name or name == 'NONE':
+        return None
+    return arm.data.edit_bones.get(name)
+
+
+def kt_merge_distance(a, b):
+    return (a - b).length
+
+
+def kt_merge_vertex_groups(arm_obj, bone_a_name, bone_b_name):
+    """
+    Add bone B weights to bone A on every mesh using this armature,
+    then remove bone B's vertex group.
+    """
+    merged_objects = []
+
+    for obj in bpy.data.objects:
+        if obj.type != 'MESH':
+            continue
+
+        uses_armature = any(
+            mod.type == 'ARMATURE' and mod.object == arm_obj
+            for mod in obj.modifiers
+        )
+        if not uses_armature:
+            continue
+
+        vg_b = obj.vertex_groups.get(bone_b_name)
+        if not vg_b:
+            continue
+
+        vg_a = obj.vertex_groups.get(bone_a_name)
+        if not vg_a:
+            vg_a = obj.vertex_groups.new(name=bone_a_name)
+
+        weights_b = {}
+        for vertex in obj.data.vertices:
+            try:
+                weight = vg_b.weight(vertex.index)
+            except RuntimeError:
+                weight = 0.0
+
+            if weight != 0.0:
+                weights_b[vertex.index] = weight
+
+        for vertex_index, weight_b in weights_b.items():
+            try:
+                weight_a = vg_a.weight(vertex_index)
+            except RuntimeError:
+                weight_a = 0.0
+
+            vg_a.add([vertex_index], weight_a + weight_b, 'REPLACE')
+
+        obj.vertex_groups.remove(vg_b)
+        merged_objects.append(obj.name)
+
+    return merged_objects
+
+
+class RIGTOOLS_OT_merge_bones(bpy.types.Operator):
+    bl_idname = "rigtools.merge_bones"
+    bl_label = "Fusionar huesos"
+    bl_description = (
+        "Fusiona dos huesos consecutivos: cabeza del primero + cola del segundo. "
+        "Tambien suma sus pesos en las mallas asociadas."
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        arm = kt_merge_armature_from_context(context)
+
+        if not arm:
+            self.report({'ERROR'}, "Selecciona un Armature.")
+            return {'CANCELLED'}
+
+        if arm.mode != 'EDIT':
+            self.report({'ERROR'}, "Debes estar en Edit Mode.")
+            return {'CANCELLED'}
+
+        name_a = arm.rigtools_bone_a
+        name_b = arm.rigtools_bone_b
+
+        bone_a = kt_merge_get_edit_bone(arm, name_a)
+        bone_b = kt_merge_get_edit_bone(arm, name_b)
+
+        if not bone_a or not bone_b:
+            self.report({'ERROR'}, "Selecciona los dos huesos.")
+            return {'CANCELLED'}
+
+        if bone_a == bone_b:
+            self.report({'ERROR'}, "Los dos huesos deben ser diferentes.")
+            return {'CANCELLED'}
+
+        def is_direct_child(parent_bone, child_bone):
+            return child_bone.parent == parent_bone
+
+        if is_direct_child(bone_a, bone_b):
+            first = bone_a
+            second = bone_b
+        elif is_direct_child(bone_b, bone_a):
+            first = bone_b
+            second = bone_a
+        else:
+            eps = max(bone_a.length, bone_b.length) * 0.05
+
+            if kt_merge_distance(bone_a.tail, bone_b.head) <= eps:
+                first = bone_a
+                second = bone_b
+            elif kt_merge_distance(bone_b.tail, bone_a.head) <= eps:
+                first = bone_b
+                second = bone_a
+            else:
+                self.report(
+                    {'ERROR'},
+                    "Los huesos deben ser padre e hijo directo, o estar "
+                    "practicamente conectados."
+                )
+                return {'CANCELLED'}
+
+        first_name = first.name
+        second_name = second.name
+
+        new_head = first.head.copy()
+        new_tail = second.tail.copy()
+
+        parent = first.parent
+        first_was_connected = first.use_connect
+        children = list(second.children)
+        roll = first.roll
+
+        new_name = context.scene.rigtools_new_name.strip() or first_name
+
+        if new_name == second_name:
+            new_name = first_name
+
+        for child in children:
+            child.parent = None
+            child.use_connect = False
+
+        first.head = new_head
+        first.tail = new_tail
+        first.roll = roll
+
+        for child in children:
+            child.parent = first
+            child.use_connect = False
+
+        first.parent = parent
+        first.use_connect = bool(parent and first_was_connected)
+
+        existing_name = arm.data.edit_bones.get(new_name)
+        if existing_name and existing_name not in {first, second}:
+            self.report(
+                {'ERROR'},
+                f"Ya existe un hueso llamado '{new_name}'. Elige otro nombre."
+            )
+            return {'CANCELLED'}
+
+        first.name = new_name
+
+        merged_meshes = kt_merge_vertex_groups(
+            arm, first.name, second_name
+        )
+
+        arm.data.edit_bones.remove(second)
+
+        arm.rigtools_bone_a = first.name
+        arm.rigtools_bone_b = first.name
+
+        msg = f"Fusionados: {first_name} + {second_name} -> {first.name}"
+        if merged_meshes:
+            msg += f" | Pesos transferidos en {len(merged_meshes)} malla(s)."
+
+        self.report({'INFO'}, msg)
+        return {'FINISHED'}
+
+
 class KT_OT_clean_actions(bpy.types.Operator):
     bl_idname = "kt.clean_actions"
     bl_label = "Clean Actions"
@@ -2523,10 +2712,12 @@ class VIEW3D_PT_rig_tools(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         scene = context.scene
+        active_object = context.active_object
+
         is_pose_mode = (
             context.mode == 'POSE'
-            and context.active_object is not None
-            and context.active_object.type == 'ARMATURE'
+            and active_object is not None
+            and active_object.type == 'ARMATURE'
         )
         has_selected_controller = (
             is_pose_mode
@@ -2535,50 +2726,138 @@ class VIEW3D_PT_rig_tools(bpy.types.Panel):
 
         col = layout.column(align=True)
 
-        row = col.row(align=True)
-        row.enabled = is_pose_mode
-        row.operator(
-            "kt.create_controllers",
-            text="Create Controller",
-            icon='BONE_DATA'
-        )
-
-        row = col.row(align=True)
-        row.enabled = is_pose_mode
-        row.operator(
-            "kt.delete_controllers",
-            text="Delete Controller",
-            icon='TRASH'
-        )
-
-        col.separator(factor=0.5)
-
-        row = col.row(align=True)
-        row.enabled = has_selected_controller
+        # --------------------------------------------------------
+        # CONTROLLERS
+        # --------------------------------------------------------
+        controllers_box = col.box()
+        row = controllers_box.row(align=True)
         row.prop(
             scene,
-            "kt_rig_shape_preset",
-            text="Shape Preset"
+            "kt_rig_controllers_expanded",
+            text="Controllers",
+            icon=(
+                'TRIA_DOWN'
+                if scene.kt_rig_controllers_expanded
+                else 'TRIA_RIGHT'
+            ),
+            emboss=False,
         )
 
-        row = col.row(align=True)
-        row.enabled = has_selected_controller
-        row.prop(scene, "kt_rig_controller_color", text="")
-        row.operator(
-            "kt.apply_controller_color",
-            text="Change Color",
-            icon='COLOR'
+        if scene.kt_rig_controllers_expanded:
+            row = controllers_box.row(align=True)
+            row.enabled = is_pose_mode
+            row.operator(
+                "kt.create_controllers",
+                text="Create Controller",
+                icon='BONE_DATA'
+            )
+
+            row = controllers_box.row(align=True)
+            row.enabled = is_pose_mode
+            row.operator(
+                "kt.delete_controllers",
+                text="Delete Controller",
+                icon='TRASH'
+            )
+
+            controllers_box.separator(factor=0.5)
+
+            row = controllers_box.row(align=True)
+            row.enabled = has_selected_controller
+            row.prop(
+                scene,
+                "kt_rig_shape_preset",
+                text="Shape Preset"
+            )
+
+            row = controllers_box.row(align=True)
+            row.enabled = has_selected_controller
+            row.prop(scene, "kt_rig_controller_color", text="")
+            row.operator(
+                "kt.apply_controller_color",
+                text="Change Color",
+                icon='COLOR'
+            )
+
+            if not is_pose_mode:
+                controllers_box.label(
+                    text="Select bones in Pose Mode",
+                    icon='INFO'
+                )
+
+        # --------------------------------------------------------
+        # FUSIONAR HUESOS
+        # --------------------------------------------------------
+        merge_box = col.box()
+        row = merge_box.row(align=True)
+        row.prop(
+            scene,
+            "kt_rig_merge_bones_expanded",
+            text="Fusionar huesos",
+            icon=(
+                'TRIA_DOWN'
+                if scene.kt_rig_merge_bones_expanded
+                else 'TRIA_RIGHT'
+            ),
+            emboss=False,
         )
 
+        if scene.kt_rig_merge_bones_expanded:
+            arm = (
+                active_object
+                if active_object is not None and active_object.type == 'ARMATURE'
+                else None
+            )
+
+            if arm is None:
+                merge_box.label(text="Selecciona un Armature", icon='INFO')
+            elif arm.mode != 'EDIT':
+                merge_box.label(text="Entra en Edit Mode", icon='EDITMODE_HLT')
+            else:
+                merge_col = merge_box.column(align=True)
+                merge_col.label(text="Huesos a fusionar:", icon='BONE_DATA')
+                merge_col.prop_search(
+                    arm,
+                    "rigtools_bone_a",
+                    arm.data,
+                    "edit_bones",
+                    text="Primero"
+                )
+                merge_col.prop_search(
+                    arm,
+                    "rigtools_bone_b",
+                    arm.data,
+                    "edit_bones",
+                    text="Segundo"
+                )
+
+                merge_col.separator()
+                merge_col.prop(
+                    scene,
+                    "rigtools_new_name",
+                    text="Nombre final"
+                )
+
+                merge_col.separator()
+                merge_col.operator(
+                    "rigtools.merge_bones",
+                    text="Fusionar huesos",
+                    icon='AUTOMERGE_OFF'
+                )
+
+                info_box = merge_box.box()
+                info_box.label(text="Requisito", icon='INFO')
+                info_box.label(text="Los huesos deben estar conectados.")
+                info_box.label(text="A -> B = cabeza A + cola B.")
+                info_box.label(text="Los pesos de B pasan a A.")
+
+        # Clean Actions stays outside both subsections.
         col.separator(factor=0.7)
         col.operator(
             "kt.clean_actions",
             text="Clean Actions",
             icon='TRASH'
         )
-
-        if not is_pose_mode:
-            col.label(text="Select bones in Pose Mode", icon='INFO')
 
 
 class VIEW3D_PT_info_panel(bpy.types.Panel):
@@ -2656,6 +2935,7 @@ classes = (
     KT_OT_delete_controllers,
     KT_OT_set_controller_shape,
     KT_OT_apply_controller_color,
+    RIGTOOLS_OT_merge_bones,
     KT_OT_clean_actions,
     KT_OT_update_addon,
 )
@@ -2756,6 +3036,34 @@ def register():
         max=1.0,
         default=(0.12, 0.55, 1.0),
     )
+
+    bpy.types.Scene.kt_rig_controllers_expanded = bpy.props.BoolProperty(
+        name="Controllers",
+        default=True,
+    )
+
+    bpy.types.Scene.kt_rig_merge_bones_expanded = bpy.props.BoolProperty(
+        name="Fusionar huesos",
+        default=False,
+    )
+
+    bpy.types.Object.rigtools_bone_a = bpy.props.StringProperty(
+        name="Hueso A",
+        description="Primer hueso de la cadena",
+        default="",
+    )
+
+    bpy.types.Object.rigtools_bone_b = bpy.props.StringProperty(
+        name="Hueso B",
+        description="Segundo hueso de la cadena",
+        default="",
+    )
+
+    bpy.types.Scene.rigtools_new_name = bpy.props.StringProperty(
+        name="Nombre final",
+        description="Nombre del hueso fusionado",
+        default="",
+    )
     
     if viewport_mode_handler not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(viewport_mode_handler)
@@ -2792,6 +3100,21 @@ def unregister():
 
     if hasattr(bpy.types.Scene, "kt_rig_controller_color"):
         del bpy.types.Scene.kt_rig_controller_color
+
+    if hasattr(bpy.types.Scene, "kt_rig_controllers_expanded"):
+        del bpy.types.Scene.kt_rig_controllers_expanded
+
+    if hasattr(bpy.types.Scene, "kt_rig_merge_bones_expanded"):
+        del bpy.types.Scene.kt_rig_merge_bones_expanded
+
+    if hasattr(bpy.types.Scene, "rigtools_new_name"):
+        del bpy.types.Scene.rigtools_new_name
+
+    if hasattr(bpy.types.Object, "rigtools_bone_a"):
+        del bpy.types.Object.rigtools_bone_a
+
+    if hasattr(bpy.types.Object, "rigtools_bone_b"):
+        del bpy.types.Object.rigtools_bone_b
 
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
