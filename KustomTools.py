@@ -2457,7 +2457,7 @@ def update_enabled(self, context):
 # ------------------------------------------------------------
 
 class VIEW3D_PT_cursor_align_sidebar(bpy.types.Panel):
-    bl_label = "Cursor Align"
+    bl_label = "------ Cursor Align"
     bl_idname = "VIEW3D_PT_cursor_align_sidebar"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
@@ -2547,7 +2547,7 @@ class VIEW3D_PT_cursor_align_sidebar(bpy.types.Panel):
         status_box.label(text=scene.cursor_align_status)
 
 class VIEW3D_PT_viewport_tools(bpy.types.Panel):
-    bl_label = "Viewport Tools"
+    bl_label = "------ Viewport Tools"
     bl_idname = "VIEW3D_PT_viewport_tools"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
@@ -2589,7 +2589,7 @@ class VIEW3D_PT_viewport_tools(bpy.types.Panel):
 
 
 class VIEW3D_PT_material_tools(bpy.types.Panel):
-    bl_label = "Material Tools"
+    bl_label = "------ Material Tools"
     bl_idname = "VIEW3D_PT_material_tools"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
@@ -2677,7 +2677,7 @@ class VIEW3D_PT_material_tools(bpy.types.Panel):
 
 
 class VIEW3D_PT_modeling_tools(bpy.types.Panel):
-    bl_label = "Modeling Tools"
+    bl_label = "------ Modeling Tools"
     bl_idname = "VIEW3D_PT_modeling_tools"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
@@ -2702,7 +2702,7 @@ class VIEW3D_PT_modeling_tools(bpy.types.Panel):
 
 
 class VIEW3D_PT_rig_tools(bpy.types.Panel):
-    bl_label = "Ani/Rig Tools"
+    bl_label = "------ Ani/Rig Tools"
     bl_idname = "VIEW3D_PT_rig_tools"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
@@ -2861,7 +2861,7 @@ class VIEW3D_PT_rig_tools(bpy.types.Panel):
 
 
 class VIEW3D_PT_info_panel(bpy.types.Panel):
-    bl_label = "Info"
+    bl_label = "------ Info"
     bl_idname = "VIEW3D_PT_info_panel"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
@@ -3039,7 +3039,7 @@ def register():
 
     bpy.types.Scene.kt_rig_controllers_expanded = bpy.props.BoolProperty(
         name="Controllers",
-        default=True,
+        default=False,
     )
 
     bpy.types.Scene.kt_rig_merge_bones_expanded = bpy.props.BoolProperty(
