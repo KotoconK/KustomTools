@@ -2,7 +2,7 @@
 bl_info = {
     "name": "KustomTools",
     "author": "Álvaro_A",
-    "version": (2, 0, 0),
+    "version": (2, 0, 1),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Kustom Tools",
     "description": "General art, modeling, rigging and integrated motion-retarget tools",
@@ -4827,7 +4827,7 @@ class KTMRT_OT_Analyze(Operator):
 
         # Auto-map immediately if a target is already selected.
         if target and target.type == 'ARMATURE':
-            bpy.ops.mrt.auto_map()
+            bpy.ops.kt_mrt.auto_map()
 
         self.report({'INFO'}, settings.status_message)
         return {'FINISHED'}
@@ -6273,15 +6273,6 @@ def pose_bone_curve_property(data_path, bone_prefix):
     return data_path[len(prefix):]
 
 
-def selected_pose_bone_names(context, rig):
-    if not rig or context.active_object != rig or context.mode != 'POSE':
-        return []
-    try:
-        return [pb.name for pb in (context.selected_pose_bones or [])]
-    except Exception:
-        return []
-
-
 def copy_item_properties(item):
     properties = set()
     if item.copy_location:
@@ -6439,52 +6430,6 @@ class KTMRT_OT_UseCurrentCopyAction(Operator):
         return {'FINISHED'}
 
 
-class KTMRT_OT_UseActiveCopySource(Operator):
-    bl_idname = "kt_mrt.use_active_copy_source"
-    bl_label = "Use Active Bone as Source"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    def execute(self, context):
-        settings = context.scene.kt_mrt_settings
-        rig = settings.copy_source_armature or context.active_object
-        if not rig or rig.type != 'ARMATURE':
-            self.report({'ERROR'}, "Choose a Source Rig first")
-            return {'CANCELLED'}
-
-        name = active_bone_name_for_rig(context, rig)
-        if not name:
-            self.report({'ERROR'}, "Make the Source Rig active and select a pose bone")
-            return {'CANCELLED'}
-
-        settings.copy_source_armature = rig
-        item = active_copy_mapping(settings, create=True)
-        item.source_bone = name
-        return {'FINISHED'}
-
-
-class KTMRT_OT_UseActiveCopyTarget(Operator):
-    bl_idname = "kt_mrt.use_active_copy_target"
-    bl_label = "Use Active Bone as Destination"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    def execute(self, context):
-        settings = context.scene.kt_mrt_settings
-        rig = settings.copy_target_armature or context.active_object
-        if not rig or rig.type != 'ARMATURE':
-            self.report({'ERROR'}, "Choose a Target Rig first")
-            return {'CANCELLED'}
-
-        name = active_bone_name_for_rig(context, rig)
-        if not name:
-            self.report({'ERROR'}, "Make the Target Rig active and select a pose bone")
-            return {'CANCELLED'}
-
-        settings.copy_target_armature = rig
-        item = active_copy_mapping(settings, create=True)
-        item.target_bone = name
-        return {'FINISHED'}
-
-
 class KTMRT_OT_AddCopyDestination(Operator):
     bl_idname = "kt_mrt.add_copy_destination"
     bl_label = "Add Bone Copy Row"
@@ -6556,56 +6501,6 @@ class KTMRT_OT_ClearCopyDestinations(Operator):
         settings.copy_destinations.clear()
         settings.copy_destination_index = 0
         settings.copy_status = "Bone Copy rows cleared"
-        return {'FINISHED'}
-
-
-class KTMRT_OT_AddSelectedCopyDestinations(Operator):
-    bl_idname = "kt_mrt.add_selected_copy_destinations"
-    bl_label = "Add Selected Target Bones"
-    bl_description = "Create one row per selected Target Pose Bone, using the active row's Source Bone"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    def execute(self, context):
-        settings = context.scene.kt_mrt_settings
-        target_rig = settings.copy_target_armature
-        if not target_rig or target_rig.type != 'ARMATURE':
-            self.report({'ERROR'}, "Choose a Target Rig")
-            return {'CANCELLED'}
-
-        template = active_copy_mapping(settings, create=False)
-        if template is None or not template.source_bone:
-            self.report({'ERROR'}, "Choose a Source Bone in the active Bone Copy row first")
-            return {'CANCELLED'}
-
-        names = selected_pose_bone_names(context, target_rig)
-        if not names:
-            self.report({'ERROR'}, "Select destination bones on the Target Rig in Pose Mode")
-            return {'CANCELLED'}
-
-        existing = {
-            (item.source_bone, item.target_bone)
-            for item in settings.copy_destinations
-            if item.source_bone and item.target_bone
-        }
-        added = 0
-
-        for name in names:
-            pair = (template.source_bone, name)
-            if pair in existing:
-                continue
-            item = settings.copy_destinations.add()
-            item.source_bone = template.source_bone
-            item.target_bone = name
-            item.copy_rotation = template.copy_rotation
-            item.copy_location = template.copy_location
-            item.copy_scale = template.copy_scale
-            existing.add(pair)
-            added += 1
-
-        if added:
-            settings.copy_destination_index = len(settings.copy_destinations) - 1
-        settings.copy_status = f"Added {added} destination bone{'s' if added != 1 else ''}"
-        self.report({'INFO'}, settings.copy_status)
         return {'FINISHED'}
 
 
@@ -7278,17 +7173,6 @@ class KTMRT_PT_CopyBoneAnimation(Panel):
         tools.operator("kt_mrt.duplicate_copy_destination", text="", icon='DUPLICATE')
         tools.operator("kt_mrt.clear_copy_destinations", text="", icon='TRASH')
 
-        row = mappings.row(align=True)
-        row.operator("kt_mrt.use_active_copy_source", text="Set Source from Active", icon='EYEDROPPER')
-        row.operator("kt_mrt.use_active_copy_target", text="Set Target from Active", icon='EYEDROPPER')
-
-        row = mappings.row(align=True)
-        row.operator(
-            "kt_mrt.add_selected_copy_destinations",
-            text="Add Selected Target Bones",
-            icon='ADD',
-        )
-
         button = layout.row(align=True)
         button.scale_y = 1.2
         direct_write = settings.copy_output_mode == 'CURRENT'
@@ -7347,13 +7231,10 @@ KTMRT_CLASSES = (
     KTMRT_OT_ApplyBoneOffset,
     KTMRT_OT_UseSelectedCopyRig,
     KTMRT_OT_UseCurrentCopyAction,
-    KTMRT_OT_UseActiveCopySource,
-    KTMRT_OT_UseActiveCopyTarget,
     KTMRT_OT_AddCopyDestination,
     KTMRT_OT_DuplicateCopyDestination,
     KTMRT_OT_RemoveCopyDestination,
     KTMRT_OT_ClearCopyDestinations,
-    KTMRT_OT_AddSelectedCopyDestinations,
     KTMRT_OT_CopyBoneAnimation,
     KTMRT_PT_Main,
     KTMRT_PT_BatchRename,
