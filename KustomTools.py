@@ -2,10 +2,10 @@
 bl_info = {
     "name": "KustomTools",
     "author": "Álvaro_A",
-    "version": (1, 9, 7),
+    "version": (2, 0, 0),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Kustom Tools",
-    "description": "Orient Cursor tools and basic color settings to improve experience",
+    "description": "General art, modeling, rigging and integrated motion-retarget tools",
     "category": "3D View",
 }
 
@@ -14,9 +14,28 @@ import bmesh
 import urllib.request
 import os
 import math
-from mathutils import Vector
+from mathutils import Matrix, Vector
 from mathutils.bvhtree import BVHTree
 from bpy_extras import view3d_utils
+import re
+import json
+import difflib
+import shutil
+from bpy.types import Operator, Panel, PropertyGroup, UIList
+from bpy.props import (
+    BoolProperty,
+    CollectionProperty,
+    EnumProperty,
+    FloatProperty,
+    IntProperty,
+    PointerProperty,
+    StringProperty,
+)
+
+try:
+    from bpy_extras.anim_utils import action_ensure_channelbag_for_slot
+except Exception:
+    action_ensure_channelbag_for_slot = None
 
 ADDON_VERSION = bl_info["version"]
 addon_keymaps = []
@@ -2453,6 +2472,32 @@ def update_enabled(self, context):
 
 
 # ------------------------------------------------------------
+# INTEGRATED RETARGET TOGGLE
+# ------------------------------------------------------------
+
+class KT_OT_toggle_retarget(bpy.types.Operator):
+    bl_idname = "kt.toggle_retarget"
+    bl_label = "Toggle Retarget"
+    bl_description = "Show or hide the integrated Retarget sidebar tab"
+
+    def execute(self, context):
+        scene = context.scene
+        scene.kt_retarget_enabled = not scene.kt_retarget_enabled
+
+        wm = context.window_manager
+        for window in wm.windows:
+            screen = window.screen
+            if screen is None:
+                continue
+            for area in screen.areas:
+                area.tag_redraw()
+
+        state = "enabled" if scene.kt_retarget_enabled else "disabled"
+        self.report({'INFO'}, f"Retarget tab {state}")
+        return {'FINISHED'}
+
+
+# ------------------------------------------------------------
 # UI
 # ------------------------------------------------------------
 
@@ -2727,6 +2772,23 @@ class VIEW3D_PT_rig_tools(bpy.types.Panel):
         col = layout.column(align=True)
 
         # --------------------------------------------------------
+        # RETARGET TAB
+        # --------------------------------------------------------
+        row = col.row(align=True)
+        row.scale_y = 1.25
+        row.operator(
+            "kt.toggle_retarget",
+            text="Retarget ON" if scene.kt_retarget_enabled else "Retarget OFF",
+            icon='ACTION',
+            depress=scene.kt_retarget_enabled,
+        )
+
+        if scene.kt_retarget_enabled:
+            col.label(text="Retarget sidebar tab enabled", icon='CHECKMARK')
+
+        col.separator(factor=0.5)
+
+        # --------------------------------------------------------
         # CONTROLLERS
         # --------------------------------------------------------
         controllers_box = col.box()
@@ -2904,6 +2966,4403 @@ class VIEW3D_PT_info_panel(bpy.types.Panel):
         box.separator(factor=0.3)
         box.label(text="Developed by Álvaro_A")
 
+# ============================================================================
+# INTEGRATED MOTION RETARGET
+# ============================================================================
+
+# -----------------------------------------------------------------------------
+# Constants / caches
+# -----------------------------------------------------------------------------
+
+KTMRT_ADDON_VERSION = 11
+PRESET_FOLDER_NAME = "KustomTools_Retarget_Mappings"
+IGNORE_MAPPING = ""
+CURRENT_REFERENCE_SPACE = "ARMATURE_DELTA_V3"
+COMPAT_REFERENCE_SPACES = {"ARMATURE_DELTA_V2", CURRENT_REFERENCE_SPACE}
+
+_PRESET_ITEMS_CACHE = []
+
+
+# -----------------------------------------------------------------------------
+# Generic helpers
+# -----------------------------------------------------------------------------
+
+def addon_directory():
+    return os.path.dirname(os.path.realpath(__file__))
+
+
+_LEGACY_PRESET_MIGRATION_DONE = False
+
+
+def preset_directory(create=False):
+    path = os.path.join(addon_directory(), PRESET_FOLDER_NAME)
+    if create:
+        os.makedirs(path, exist_ok=True)
+    return path
+
+
+def migrate_legacy_retarget_presets():
+    """Copy existing Motion Retarget JSON presets into the unified KustomTools folder."""
+    global _LEGACY_PRESET_MIGRATION_DONE
+    if _LEGACY_PRESET_MIGRATION_DONE:
+        return
+    _LEGACY_PRESET_MIGRATION_DONE = True
+
+    destination = preset_directory(create=True)
+    addon_dir = addon_directory()
+    addon_root = addon_dir if os.path.basename(addon_dir).lower() in {'addons', 'addons_core'} else os.path.dirname(addon_dir)
+
+    candidates = [
+        os.path.join(addon_root, 'MotionRetarget', 'mappings'),
+        os.path.join(addon_root, 'motion_retarget', 'mappings'),
+        os.path.join(addon_root, 'Motion_Retarget', 'mappings'),
+        os.path.join(addon_root, 'mappings'),
+    ]
+
+    for source_dir in candidates:
+        if os.path.abspath(source_dir) == os.path.abspath(destination):
+            continue
+        if not os.path.isdir(source_dir):
+            continue
+        try:
+            filenames = os.listdir(source_dir)
+        except Exception:
+            continue
+        for filename in filenames:
+            if not filename.lower().endswith('.json'):
+                continue
+            source_path = os.path.join(source_dir, filename)
+            target_path = os.path.join(destination, filename)
+            if os.path.exists(target_path):
+                continue
+            try:
+                shutil.copy2(source_path, target_path)
+            except Exception:
+                pass
+
+
+def safe_filename(value):
+    value = (value or "mapping").strip()
+    value = re.sub(r"[^A-Za-z0-9._-]+", "_", value)
+    value = value.strip("._-")
+    return value or "mapping"
+
+
+def armature_poll(self, obj):
+    return obj is not None and obj.type == 'ARMATURE'
+
+
+def hierarchy_depth(bone):
+    depth = 0
+    parent = bone.parent
+    while parent:
+        depth += 1
+        parent = parent.parent
+    return depth
+
+
+def hierarchy_order(armature_obj):
+    order = {}
+    counter = 0
+
+    def walk(bone):
+        nonlocal counter
+        order[bone.name] = counter
+        counter += 1
+        for child in bone.children:
+            walk(child)
+
+    roots = [b for b in armature_obj.data.bones if b.parent is None]
+    for root in roots:
+        walk(root)
+    return order
+
+
+def armature_height(obj):
+    """Approximate character height in world space.
+
+    Prefer world Z extent (Blender's usual up axis) rather than the largest axis,
+    because a T-pose arm span can be wider than the character is tall.
+    """
+    if not obj or obj.type != 'ARMATURE' or not obj.data.bones:
+        return 1.0
+
+    points = []
+    for bone in obj.data.bones:
+        points.append(obj.matrix_world @ bone.head_local)
+        points.append(obj.matrix_world @ bone.tail_local)
+
+    min_v = Vector((min(p.x for p in points), min(p.y for p in points), min(p.z for p in points)))
+    max_v = Vector((max(p.x for p in points), max(p.y for p in points), max(p.z for p in points)))
+    ext = max_v - min_v
+
+    z_height = abs(ext.z)
+    if z_height > 1e-6:
+        return z_height
+    return max(abs(ext.x), abs(ext.y), abs(ext.z), 1e-6)
+
+
+def frame_sequence(start, end, step=1):
+    start_i = int(math.floor(start))
+    end_i = int(math.ceil(end))
+    step = max(1, int(step))
+    frames = list(range(start_i, end_i + 1, step))
+    if not frames or frames[-1] != end_i:
+        frames.append(end_i)
+    return frames
+
+
+def action_range(action):
+    if not action:
+        return 1, 1
+    try:
+        start, end = action.frame_range
+        return int(math.floor(start)), int(math.ceil(end))
+    except Exception:
+        return 1, 1
+
+
+def action_fcurves(action):
+    """Return F-Curves from both legacy and layered/slot-based Actions."""
+    if not action:
+        return []
+
+    found = []
+    seen = set()
+
+    # Legacy / compatibility API when available.
+    try:
+        for fc in action.fcurves:
+            ptr = fc.as_pointer()
+            if ptr not in seen:
+                seen.add(ptr)
+                found.append(fc)
+    except Exception:
+        pass
+
+    # Blender layered Actions: layers -> strips -> channelbags -> fcurves.
+    try:
+        for layer in action.layers:
+            for strip in layer.strips:
+                channelbags = getattr(strip, "channelbags", None)
+                if channelbags is None:
+                    continue
+                for channelbag in channelbags:
+                    for fc in channelbag.fcurves:
+                        ptr = fc.as_pointer()
+                        if ptr not in seen:
+                            seen.add(ptr)
+                            found.append(fc)
+    except Exception:
+        pass
+
+    return found
+
+
+_BONE_PATH_RE = re.compile(r'pose\.bones\[(["\'])(.*?)\1\]')
+
+
+def keyed_bone_names(action):
+    names = set()
+    for fc in action_fcurves(action):
+        match = _BONE_PATH_RE.search(fc.data_path)
+        if match:
+            names.add(match.group(2))
+    return names
+
+
+def local_rest_matrix(data_bone):
+    if data_bone.parent:
+        return data_bone.parent.matrix_local.inverted_safe() @ data_bone.matrix_local
+    return data_bone.matrix_local.copy()
+
+
+def local_pose_matrix(pose_bone):
+    if pose_bone.parent:
+        return pose_bone.parent.matrix.inverted_safe() @ pose_bone.matrix
+    return pose_bone.matrix.copy()
+
+
+def evaluated_rest_delta(pose_bone):
+    """Final evaluated pose relative to the bone's own rest transform and parent."""
+    rest_local = local_rest_matrix(pose_bone.bone)
+    pose_local = local_pose_matrix(pose_bone)
+    return rest_local.inverted_safe() @ pose_local
+
+
+def rest_world_rotation(armature_obj, data_bone):
+    """World-space rest orientation without translation/scale."""
+    matrix = armature_obj.matrix_world @ data_bone.matrix_local
+    return matrix.to_quaternion().to_matrix()
+
+
+def bone_world_rest_matrix(armature_obj, data_bone):
+    return armature_obj.matrix_world @ data_bone.matrix_local
+
+
+def bone_world_pose_matrix(armature_obj, pose_bone):
+    return armature_obj.matrix_world @ pose_bone.matrix
+
+
+def matrix_to_json(matrix):
+    return json.dumps([float(matrix[r][c]) for r in range(4) for c in range(4)])
+
+
+def matrix_from_json(value):
+    if not value:
+        return None
+    try:
+        values = json.loads(value)
+        if not isinstance(values, list) or len(values) != 16:
+            return None
+        return Matrix((
+            values[0:4], values[4:8], values[8:12], values[12:16],
+        ))
+    except Exception:
+        return None
+
+
+def pose_snapshot(obj):
+    if not obj or obj.type != 'ARMATURE':
+        return "{}"
+    data = {}
+    for pb in obj.pose.bones:
+        data[pb.name] = [float(pb.matrix_basis[r][c]) for r in range(4) for c in range(4)]
+    return json.dumps(data)
+
+
+def restore_pose_snapshot(obj, payload):
+    if not obj or obj.type != 'ARMATURE' or not payload:
+        return
+    try:
+        data = json.loads(payload)
+    except Exception:
+        return
+    for name, values in data.items():
+        pb = obj.pose.bones.get(name)
+        if not pb or not isinstance(values, list) or len(values) != 16:
+            continue
+        pb.matrix_basis = Matrix((values[0:4], values[4:8], values[8:12], values[12:16]))
+
+
+def clear_pose_basis(obj):
+    if not obj or obj.type != 'ARMATURE':
+        return
+    for pb in obj.pose.bones:
+        pb.matrix_basis = Matrix.Identity(4)
+
+
+def shortest_angle_deg(quaternion):
+    try:
+        angle = math.degrees(quaternion.angle) % 360.0
+    except Exception:
+        return 0.0
+    return min(angle, 360.0 - angle)
+
+
+def reference_is_compatible(item):
+    return bool(item.has_reference and item.reference_space in COMPAT_REFERENCE_SPACES)
+
+
+def reference_is_current(item):
+    return bool(item.has_reference and item.reference_space == CURRENT_REFERENCE_SPACE)
+
+
+def armature_axis_bridge(source_obj, target_obj):
+    """Rotate a vector/quaternion from Source armature axes into Target armature axes.
+
+    FBX/Mixamo rigs often arrive with a different object-level orientation than a native
+    Blender rig. PoseBone.matrix is armature-local, so applying a source armature-space
+    delta directly to the target only works when both armature objects use the same axes.
+    """
+    try:
+        source_q = source_obj.matrix_world.to_quaternion()
+        target_q = target_obj.matrix_world.to_quaternion()
+        return target_q.inverted() @ source_q
+    except Exception:
+        from mathutils import Quaternion
+        return Quaternion((1.0, 0.0, 0.0, 0.0))
+
+
+def resolve_root_motion_target_name(settings, target, item):
+    """Return the target bone that should receive a Root/Hips Location channel.
+
+    Rotation always remains on item.target_bone. In AUTO mode, Root/Hips translation is
+    routed to the highest ancestor of that mapped target. This lets a rig such as
+    Bone -> spine receive Hips rotation on spine while Bone carries the character motion.
+    """
+    mapped_name = item.target_bone
+    if not target or not mapped_name or not item.copy_location:
+        return mapped_name
+    if bone_class(item.source_bone) not in {'root', 'hips'}:
+        return mapped_name
+
+    mode = getattr(settings, 'root_motion_mode', 'AUTO')
+    if mode == 'MAPPED':
+        return mapped_name
+    if mode == 'CUSTOM':
+        custom = getattr(settings, 'root_motion_target', '')
+        if custom and target.pose.bones.get(custom):
+            return custom
+        return mapped_name
+
+    pb = target.pose.bones.get(mapped_name)
+    if not pb:
+        return mapped_name
+    while pb.parent:
+        pb = pb.parent
+    return pb.name
+
+
+def active_ik_constraints(target):
+    """Return enabled IK/Spline-IK constraints that can override a baked pose."""
+    found = []
+    if not target or target.type != 'ARMATURE':
+        return found
+    for pb in target.pose.bones:
+        for con in pb.constraints:
+            if con.type not in {'IK', 'SPLINE_IK'}:
+                continue
+            if getattr(con, 'mute', False):
+                continue
+            if float(getattr(con, 'influence', 1.0)) <= 1e-8:
+                continue
+            found.append((pb.name, con.name))
+    return found
+
+
+def calibrated_target_matrix(source_obj, source_pb, target_obj, target_pb,
+                             target_current_armature, source_reference_armature, target_reference_armature,
+                             copy_location=True, copy_rotation=True, copy_scale=False,
+                             global_root_scale=1.0):
+    """Transfer motion from an equivalent captured pose in armature space.
+
+    The source delta is first converted from Source armature axes to Target armature axes.
+    This is important when an imported rig and a native Blender rig have different object
+    rotations even though the characters appear upright in the viewport.
+    """
+    src_pose = source_pb.matrix.copy()
+    src_ref = source_reference_armature
+    tgt_ref = target_reference_armature
+    bridge_q = armature_axis_bridge(source_obj, target_obj)
+
+    src_pose_q = src_pose.to_quaternion()
+    src_ref_q = src_ref.to_quaternion()
+    tgt_ref_q = tgt_ref.to_quaternion()
+
+    if copy_rotation:
+        source_delta_q = src_pose_q @ src_ref_q.inverted()
+        target_delta_q = bridge_q @ source_delta_q @ bridge_q.inverted()
+        out_rot_armature = target_delta_q @ tgt_ref_q
+    else:
+        out_rot_armature = target_current_armature.to_quaternion()
+
+    if copy_location:
+        src_delta_armature = src_pose.translation - src_ref.translation
+        src_delta_target_axes = bridge_q @ src_delta_armature
+        loc_scale = mapped_location_scale(
+            source_obj, source_pb, target_obj, target_pb,
+            global_root_scale=global_root_scale,
+        )
+        out_loc_armature = tgt_ref.translation + src_delta_target_axes * loc_scale
+    else:
+        out_loc_armature = target_current_armature.translation.copy()
+
+    out_scale_armature = target_current_armature.to_scale()
+    if copy_scale:
+        src_ref_scale = src_ref.to_scale()
+        src_pose_scale = src_pose.to_scale()
+        scale_delta = Vector((
+            src_pose_scale.x / max(abs(src_ref_scale.x), 1e-6),
+            src_pose_scale.y / max(abs(src_ref_scale.y), 1e-6),
+            src_pose_scale.z / max(abs(src_ref_scale.z), 1e-6),
+        ))
+        out_scale_armature = Vector((
+            out_scale_armature.x * scale_delta.x,
+            out_scale_armature.y * scale_delta.y,
+            out_scale_armature.z * scale_delta.z,
+        ))
+
+    return Matrix.LocRotScale(out_loc_armature, out_rot_armature, out_scale_armature)
+
+
+def mapped_location_scale(source_obj, source_pb, target_obj, target_pb, global_root_scale=1.0):
+    """Scale translation deltas without requiring source/target hierarchy to match."""
+    if is_root_like(source_pb.name, source_pb.bone) or is_root_like(target_pb.name, target_pb.bone):
+        return global_root_scale
+    return max(target_pb.bone.length, 1e-6) / max(source_pb.bone.length, 1e-6)
+
+
+def armature_local_extent(obj):
+    """Character size in armature-local units, independent of Object scale.
+
+    Retargeted PoseBone.matrix translations are expressed in armature-local units. Using a
+    world-space height here is wrong for common FBX rigs where the Armature object carries a
+    0.01 scale while the bones themselves are stored in centimetre-like local units.
+    """
+    if not obj or obj.type != 'ARMATURE' or not obj.data.bones:
+        return 1.0
+    points = []
+    for bone in obj.data.bones:
+        points.append(bone.head_local)
+        points.append(bone.tail_local)
+    min_v = Vector((min(p.x for p in points), min(p.y for p in points), min(p.z for p in points)))
+    max_v = Vector((max(p.x for p in points), max(p.y for p in points), max(p.z for p in points)))
+    ext = max_v - min_v
+    return max(abs(ext.x), abs(ext.y), abs(ext.z), 1e-6)
+
+
+def mapped_character_scale(source, target, mappings):
+    """Robust Source-local -> Target-local unit/proportion conversion.
+
+    Use the median length ratio of mapped body bones. This ignores detached helpers/poles and,
+    unlike world-space armature height, correctly handles FBX object-scale differences.
+    """
+    ratios = []
+    for item in mappings:
+        src_bone = source.data.bones.get(item.source_bone)
+        tgt_bone = target.data.bones.get(item.target_bone)
+        if not src_bone or not tgt_bone:
+            continue
+        cls = bone_class(item.source_bone)
+        if cls in {'root', 'finger', 'thumb', 'toe', 'other'}:
+            continue
+        src_len = float(src_bone.length)
+        tgt_len = float(tgt_bone.length)
+        if src_len <= 1e-8 or tgt_len <= 1e-8:
+            continue
+        ratio = tgt_len / src_len
+        if 1e-5 < ratio < 1e5:
+            ratios.append(ratio)
+
+    if len(ratios) >= 3:
+        ratios.sort()
+        middle = len(ratios) // 2
+        if len(ratios) % 2:
+            return ratios[middle]
+        return 0.5 * (ratios[middle - 1] + ratios[middle])
+
+    return armature_local_extent(target) / max(armature_local_extent(source), 1e-6)
+
+
+def world_aligned_target_matrix(source_obj, source_pb, target_obj, target_pb,
+                                target_current_world,
+                                copy_location=True, copy_rotation=True, copy_scale=False,
+                                global_root_scale=1.0, rotation_mode='REST_LOCAL'):
+    """Build an absolute target pose from source evaluated world motion.
+
+    This does not assume that the source and target bones have the same parent, root,
+    hierarchy depth, rest pose, or bone roll. A constant world-space rest alignment is
+    computed per mapped bone, then applied to the evaluated source pose.
+
+    When Location is disabled, the target bone keeps the position produced by its own
+    target hierarchy. That keeps ordinary connected limbs attached while still allowing
+    the target rotation to follow the source absolute motion.
+    """
+    src_rest = bone_world_rest_matrix(source_obj, source_pb.bone)
+    src_pose = bone_world_pose_matrix(source_obj, source_pb)
+    tgt_rest = bone_world_rest_matrix(target_obj, target_pb.bone)
+
+    src_rest_q = src_rest.to_quaternion()
+    src_pose_q = src_pose.to_quaternion()
+    tgt_rest_q = tgt_rest.to_quaternion()
+
+    # Rest-frame alignment used for translation conversion.
+    align_q = tgt_rest_q @ src_rest_q.inverted()
+
+    # Two mathematically useful retarget spaces. REST_LOCAL is the default because
+    # it transfers the source change relative to its own rest frame onto the target
+    # rest frame. WORLD_DELTA applies the source world-space change to target rest.
+    # Both keep the target exactly in its own rest pose when the source is at rest.
+    if copy_rotation:
+        if rotation_mode == 'WORLD_DELTA':
+            world_delta_q = src_pose_q @ src_rest_q.inverted()
+            out_rot_world = world_delta_q @ tgt_rest_q
+        else:  # REST_LOCAL
+            rest_local_q = src_rest_q.inverted() @ src_pose_q
+            out_rot_world = tgt_rest_q @ rest_local_q
+    else:
+        out_rot_world = target_current_world.to_quaternion()
+
+    if copy_location:
+        src_delta_world = src_pose.translation - src_rest.translation
+        loc_scale = mapped_location_scale(
+            source_obj, source_pb, target_obj, target_pb,
+            global_root_scale=global_root_scale,
+        )
+        out_loc_world = tgt_rest.translation + (align_q @ src_delta_world) * loc_scale
+    else:
+        # Preserve the position generated by the target's own hierarchy. This is crucial
+        # for connected arms/legs and lets rigs with different root/parent structures work.
+        out_loc_world = target_current_world.translation.copy()
+
+    out_scale_world = target_current_world.to_scale()
+    if copy_scale:
+        src_delta = evaluated_rest_delta(source_pb)
+        src_scale = src_delta.to_scale()
+        out_scale_world = Vector((
+            out_scale_world.x * src_scale.x,
+            out_scale_world.y * src_scale.y,
+            out_scale_world.z * src_scale.z,
+        ))
+
+    desired_world = Matrix.LocRotScale(out_loc_world, out_rot_world, out_scale_world)
+    return target_obj.matrix_world.inverted_safe() @ desired_world
+
+def matrix_motion_components(matrix):
+    loc, rot, scale = matrix.decompose()
+    # Quaternion.angle is [0, pi].
+    rot_deg = math.degrees(rot.angle)
+    scale_dev = max(abs(scale.x - 1.0), abs(scale.y - 1.0), abs(scale.z - 1.0))
+    return loc, rot, scale, rot_deg, scale_dev
+
+
+def mapping_update(self, context):
+    self.manual_override = True
+    self.confidence = -1.0
+    self.has_reference = False
+    self.reference_source_matrix = ""
+    self.reference_target_matrix = ""
+    self.reference_space = ""
+    try:
+        settings = context.scene.kt_mrt_settings
+        count = sum(1 for item in settings.mappings if reference_is_current(item))
+        settings.calibration_count = count
+        settings.has_calibration = count > 0
+    except Exception:
+        pass
+
+
+# -----------------------------------------------------------------------------
+# Bone naming / automap heuristics
+# -----------------------------------------------------------------------------
+
+_PREFIXES = (
+    "mixamorig", "def", "org", "mch", "ctrl", "control", "rig", "jnt", "joint",
+    "bip001", "bip01", "bip", "bn", "bone",
+)
+
+_ALIAS_GROUPS = {
+    "hips": {"hips", "hip", "pelvis", "pelvic", "cog"},
+    "spine": {"spine", "spinal", "torso"},
+    "chest": {"chest", "upperchest", "thorax", "ribcage"},
+    "neck": {"neck"},
+    "head": {"head"},
+    "clavicle": {"clavicle", "collar", "shoulder"},
+    "upperarm": {"upperarm", "uparm", "armupper", "humerus"},
+    "forearm": {"forearm", "lowerarm", "loarm", "armlower", "ulna"},
+    "hand": {"hand", "wrist"},
+    "thigh": {"thigh", "upperleg", "upleg", "legupper", "femur"},
+    "calf": {"calf", "shin", "lowerleg", "loleg", "leglower", "tibia"},
+    "foot": {"foot", "ankle"},
+    "toe": {"toe", "toebase", "ball"},
+    "thumb": {"thumb"},
+    "finger": {"finger", "index", "middle", "ring", "pinky", "pinkie"},
+    "root": {"root", "master", "global"},
+}
+
+_ALIAS_LOOKUP = {}
+for canonical, aliases in _ALIAS_GROUPS.items():
+    for alias in aliases:
+        _ALIAS_LOOKUP[alias] = canonical
+
+
+def detect_side(name):
+    n = name.lower().replace(" ", "")
+    if re.search(r"(^|[._:\-])l($|[._:\-0-9])", n) or "left" in n or n.endswith("_l") or n.endswith(".l"):
+        return 'L'
+    if re.search(r"(^|[._:\-])r($|[._:\-0-9])", n) or "right" in n or n.endswith("_r") or n.endswith(".r"):
+        return 'R'
+    return 'C'
+
+
+def normalize_name(name):
+    value = name.lower().strip()
+    value = value.replace("left", " l ").replace("right", " r ")
+    value = re.sub(r"[:|/\\.\-]+", "_", value)
+    value = re.sub(r"\s+", "_", value)
+    value = re.sub(r"_+", "_", value).strip("_")
+
+    parts = [p for p in value.split("_") if p]
+    while parts and any(parts[0].startswith(prefix) for prefix in _PREFIXES):
+        parts.pop(0)
+
+    # Remove isolated side tokens but retain numeric information.
+    parts = [p for p in parts if p not in {"l", "r", "left", "right"}]
+    return "_".join(parts)
+
+
+def canonical_tokens(name):
+    normalized = normalize_name(name)
+    raw_tokens = re.findall(r"[a-z]+|\d+", normalized)
+    tokens = []
+    for token in raw_tokens:
+        tokens.append(_ALIAS_LOOKUP.get(token, token))
+
+    # Alias groups are often embedded without separators (e.g. LeftForeArm).
+    joined = "".join(raw_tokens)
+    for alias, canonical in sorted(_ALIAS_LOOKUP.items(), key=lambda kv: len(kv[0]), reverse=True):
+        if alias in joined and canonical not in tokens:
+            tokens.append(canonical)
+
+    return tokens
+
+
+def bone_class(name):
+    tokens = set(canonical_tokens(name))
+    priority = (
+        "root", "hips", "spine", "chest", "neck", "head", "clavicle",
+        "upperarm", "forearm", "hand", "thigh", "calf", "foot", "toe",
+        "thumb", "finger",
+    )
+    for item in priority:
+        if item in tokens:
+            return item
+    return "other"
+
+
+def canonical_string(name):
+    return "_".join(canonical_tokens(name)) or normalize_name(name)
+
+
+def is_global_root_name(name):
+    """True for a dedicated global/root-motion bone, not the pelvis/hips."""
+    return bone_class(name) == "root"
+
+
+def is_hips_name(name):
+    """True for the anatomical pelvis/hips bone."""
+    return bone_class(name) == "hips"
+
+
+def token_similarity(a, b):
+    ta = set(canonical_tokens(a))
+    tb = set(canonical_tokens(b))
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / max(len(ta | tb), 1)
+
+
+def bone_match_score(source_name, target_name, source_depth, target_depth):
+    side_s = detect_side(source_name)
+    side_t = detect_side(target_name)
+
+    if side_s in {'L', 'R'} and side_t in {'L', 'R'} and side_s != side_t:
+        return 0.0
+
+    cs = canonical_string(source_name)
+    ct = canonical_string(target_name)
+    name_ratio = difflib.SequenceMatcher(None, cs, ct).ratio()
+    token_ratio = token_similarity(source_name, target_name)
+
+    if side_s == side_t:
+        side_score = 1.0
+    elif side_s == 'C' or side_t == 'C':
+        side_score = 0.45
+    else:
+        side_score = 0.0
+
+    depth_delta = abs(source_depth - target_depth)
+    depth_score = 1.0 / (1.0 + depth_delta)
+
+    score = (
+        name_ratio * 0.52 +
+        token_ratio * 0.23 +
+        side_score * 0.15 +
+        depth_score * 0.10
+    )
+
+    class_s = bone_class(source_name)
+    class_t = bone_class(target_name)
+
+    # Strongly protect fingers/twists/etc. from collapsing onto a hand/arm.
+    if class_s != "other" and class_t != "other" and class_s != class_t:
+        pair = {class_s, class_t}
+        # Spine/chest can vary between rigs, so penalize them less.
+        if pair <= {"spine", "chest"}:
+            score *= 0.78
+        else:
+            score *= 0.38
+
+    return max(0.0, min(1.0, score))
+
+
+def is_root_like(name, bone):
+    """Bones whose Location should use whole-character scale conversion."""
+    cls = bone_class(name)
+    return cls in {"root", "hips"}
+
+
+def mapping_channels(item):
+    channels = set()
+    if item.copy_rotation:
+        channels.add('R')
+    if item.copy_location:
+        channels.add('L')
+    if item.copy_scale:
+        channels.add('S')
+    return channels
+
+
+def chain_family(name):
+    cls = bone_class(name)
+    if cls in {"hips", "spine", "chest", "neck", "head"}:
+        return "TORSO"
+    if cls in {"clavicle", "upperarm", "forearm", "hand"}:
+        return "ARM"
+    if cls in {"thigh", "calf", "foot", "toe"}:
+        return "LEG"
+    if cls in {"thumb", "finger"}:
+        return "FINGER"
+    if cls == "root":
+        return "ROOT"
+    return "OTHER"
+
+
+def bone_is_descendant(descendant, ancestor):
+    parent = descendant.parent
+    while parent:
+        if parent == ancestor:
+            return True
+        parent = parent.parent
+    return False
+
+
+def skipped_chain_is_absorbed(item, settings, source):
+    """True when an unmapped source bone feeds a mapped downstream bone.
+
+    The bake uses evaluated world/rest motion, so a mapped descendant contains the
+    rotational effect of skipped source parents. This is useful when source chains
+    have more bones than the target chain.
+    """
+    bone = source.data.bones.get(item.source_bone)
+    if not bone:
+        return False
+    family = chain_family(bone.name)
+    if family in {"OTHER", "FINGER", "ROOT"}:
+        return False
+    side = detect_side(bone.name)
+    for other in settings.mappings:
+        if not other.target_bone:
+            continue
+        other_bone = source.data.bones.get(other.source_bone)
+        if not other_bone or not bone_is_descendant(other_bone, bone):
+            continue
+        if chain_family(other_bone.name) != family:
+            continue
+        other_side = detect_side(other_bone.name)
+        if side in {'L', 'R'} and other_side in {'L', 'R'} and side != other_side:
+            continue
+        if other.copy_rotation:
+            return True
+    return False
+
+
+# -----------------------------------------------------------------------------
+# Properties
+# -----------------------------------------------------------------------------
+
+class KTMRT_MappingItem(PropertyGroup):
+    source_bone: StringProperty(name="Source")
+    target_bone: StringProperty(name="Target", update=mapping_update)
+    importance: FloatProperty(name="Importance", default=0.0, min=0.0)
+    confidence: FloatProperty(name="Confidence", default=0.0, min=-1.0, max=1.0)
+    hierarchy_depth: IntProperty(default=0, min=0)
+    hierarchy_index: IntProperty(default=0, min=0)
+    max_rotation_deg: FloatProperty(default=0.0, min=0.0)
+    max_location: FloatProperty(default=0.0, min=0.0)
+    max_scale_deviation: FloatProperty(default=0.0, min=0.0)
+    direct_keyed: BoolProperty(default=False)
+    motion_detected: BoolProperty(
+        name="Moving / Keyed",
+        description="The source bone has evaluated motion or direct keys in the analyzed Action",
+        default=False,
+    )
+    significant: BoolProperty(default=False)
+    manual_override: BoolProperty(default=False)
+    copy_rotation: BoolProperty(name="R", default=True)
+    copy_location: BoolProperty(name="L", default=False)
+    copy_scale: BoolProperty(name="S", default=False)
+    has_reference: BoolProperty(default=False)
+    reference_source_matrix: StringProperty(default="")
+    reference_target_matrix: StringProperty(default="")
+    reference_space: StringProperty(default="")
+
+
+class KTMRT_CopyDestinationItem(PropertyGroup):
+    source_bone: StringProperty(
+        name="Source Bone",
+        description="Bone whose animation channels are copied from the Source Action",
+        default="",
+    )
+    target_bone: StringProperty(
+        name="Write To Bone",
+        description="Destination bone on the Target Rig",
+        default="",
+    )
+    copy_rotation: BoolProperty(name="R", default=True)
+    copy_location: BoolProperty(name="L", default=False)
+    copy_scale: BoolProperty(name="S", default=False)
+
+
+class KTMRT_Settings(PropertyGroup):
+    source_armature: PointerProperty(
+        name="Source Rig",
+        type=bpy.types.Object,
+        poll=armature_poll,
+    )
+    source_action: PointerProperty(
+        name="Source Action",
+        type=bpy.types.Action,
+    )
+    target_armature: PointerProperty(
+        name="Target Rig",
+        type=bpy.types.Object,
+        poll=armature_poll,
+    )
+
+    mappings: CollectionProperty(type=KTMRT_MappingItem)
+    active_mapping_index: IntProperty(default=0)
+
+    sort_mode: EnumProperty(
+        name="Sort",
+        items=[
+            ('IMPORTANCE', "Importance", "Most important motion first"),
+            ('HIERARCHY', "Hierarchy", "Source armature hierarchy"),
+            ('NAME', "Name", "Source bone name A-Z"),
+            ('CONFIDENCE', "Confidence", "Best automatic matches first"),
+        ],
+        default='IMPORTANCE',
+    )
+    filter_mode: EnumProperty(
+        name="Show",
+        items=[
+            ('ALL', "Moving / Keyed", "Bones with evaluated movement or direct animation keys"),
+            ('SIGNIFICANT', "Significant", "Only the most significant motion bones"),
+            ('UNMAPPED', "Unmapped", "All source bones without a target mapping"),
+            ('ALL_BONES', "All Bones", "Every bone in the source armature, including static bones"),
+        ],
+        default='SIGNIFICANT',
+    )
+
+    analysis_step: IntProperty(
+        name="Analysis Step",
+        description="Analyze every N frames. Use 1 for maximum accuracy",
+        default=1,
+        min=1,
+        max=20,
+    )
+    bake_step: IntProperty(
+        name="Bake Step",
+        description="Bake one key every N frames",
+        default=1,
+        min=1,
+        max=20,
+    )
+    significance_ratio: FloatProperty(
+        name="Significance",
+        description="Relative threshold used to mark the main motion bones",
+        default=0.15,
+        min=0.01,
+        max=1.0,
+        subtype='FACTOR',
+    )
+    automap_threshold: FloatProperty(
+        name="Auto-map Threshold",
+        description="Minimum confidence needed for automatic mapping",
+        default=0.56,
+        min=0.0,
+        max=1.0,
+        subtype='FACTOR',
+    )
+    scale_root_translation: BoolProperty(
+        name="Scale Root/Hips Location",
+        description="Scale copied Root/Hips location using the source/target armature size ratio",
+        default=True,
+    )
+    root_motion_mode: EnumProperty(
+        name="Root Motion",
+        description="Choose where Root/Hips Location is written on the target rig",
+        items=[
+            ('AUTO', "Auto Parent", "Route Root/Hips Location to the highest parent of the mapped target bone"),
+            ('MAPPED', "Mapped Bone", "Keep Location on the mapped target bone"),
+            ('CUSTOM', "Custom Bone", "Write Root/Hips Location to a chosen target bone"),
+        ],
+        default='AUTO',
+    )
+    root_motion_target: StringProperty(
+        name="Root Motion Bone",
+        description="Target bone that receives Root/Hips Location when Root Motion is Custom Bone",
+        default="",
+    )
+    rotation_mode: EnumProperty(
+        name="Rotation Space",
+        description="How source rest-relative rotation is transferred to the target",
+        items=[
+            ('REST_LOCAL', "Rest Local", "Apply source motion relative to source rest onto target rest; recommended default"),
+            ('WORLD_DELTA', "World Delta", "Apply the source world-space rotation change onto target rest"),
+        ],
+        default='REST_LOCAL',
+    )
+
+    analysis_start: IntProperty(default=1)
+    analysis_end: IntProperty(default=1)
+    analyzed: BoolProperty(default=False)
+    status_message: StringProperty(default="")
+    validation_report: StringProperty(default="")
+
+    preset_name: StringProperty(name="Preset Name", default="mapping")
+    preset_file: EnumProperty(name="Preset", items=lambda self, context: preset_items(self, context))
+
+    show_setup: BoolProperty(name="Setup & Analysis", default=True)
+    show_mapping: BoolProperty(name="Bone Mapping", default=True)
+    show_presets: BoolProperty(name="Mapping Presets", default=False)
+    show_validation_log: BoolProperty(name="Validation Log", default=False)
+    show_debug: BoolProperty(name="Orientation Debug", default=False)
+    debug_report: StringProperty(default="")
+
+    calibration_mode: BoolProperty(default=False)
+    has_calibration: BoolProperty(default=False)
+    calibration_count: IntProperty(default=0, min=0)
+    calibration_source_action_name: StringProperty(default="")
+    calibration_target_action_name: StringProperty(default="")
+    calibration_source_pose_snapshot: StringProperty(default="")
+    calibration_target_pose_snapshot: StringProperty(default="")
+    calibration_frame: IntProperty(default=1)
+
+    # Persistent equivalent-pose snapshots captured by Capture Reference Pose.
+    # These are different from the temporary pre-calibration snapshots above.
+    reference_source_pose_snapshot: StringProperty(default="")
+    reference_target_pose_snapshot: StringProperty(default="")
+
+    ik_disabled: BoolProperty(default=False)
+    ik_restore_state: StringProperty(default="")
+
+    rename_armature: PointerProperty(
+        name="Rig",
+        type=bpy.types.Object,
+        poll=armature_poll,
+    )
+    rename_find: StringProperty(name="Find", default="mixamorig:")
+    rename_replace: StringProperty(name="Replace", default="")
+    rename_match_mode: EnumProperty(
+        name="Match",
+        items=[
+            ('PREFIX', "Prefix", "Replace only when the text is at the start of the bone name"),
+            ('SUFFIX', "Suffix", "Replace only when the text is at the end of the bone name"),
+            ('ANYWHERE', "Anywhere", "Replace every occurrence in the bone name"),
+        ],
+        default='PREFIX',
+    )
+    rename_status: StringProperty(default="")
+
+    offset_armature: PointerProperty(
+        name="Rig",
+        type=bpy.types.Object,
+        poll=armature_poll,
+    )
+    offset_action: PointerProperty(
+        name="Action",
+        type=bpy.types.Action,
+    )
+    offset_bone: StringProperty(name="Bone", default="")
+    offset_space: EnumProperty(
+        name="Offset Space",
+        items=[
+            ('LOCAL', "Local (Bone)", "Apply the captured offset in the bone's local animation space"),
+            ('GLOBAL', "Global (World)", "Apply the captured offset in world space"),
+        ],
+        default='LOCAL',
+    )
+    offset_editing: BoolProperty(default=False)
+    offset_capture_local: StringProperty(default="")
+    offset_capture_world: StringProperty(default="")
+    offset_capture_frame: IntProperty(default=1)
+    offset_capture_action_name: StringProperty(default="")
+    offset_status: StringProperty(default="")
+
+    copy_setup_expanded: BoolProperty(
+        name="Source & Target",
+        description="Show or hide Source/Target rig and Action settings",
+        default=True,
+    )
+    copy_source_armature: PointerProperty(
+        name="Source Rig",
+        description="Rig that owns the animation curves to copy",
+        type=bpy.types.Object,
+        poll=armature_poll,
+    )
+    copy_source_action: PointerProperty(
+        name="Source Action",
+        description="Action containing the source-bone curves",
+        type=bpy.types.Action,
+    )
+    copy_target_armature: PointerProperty(
+        name="Target Rig",
+        description="Rig whose bones receive the copied animation",
+        type=bpy.types.Object,
+        poll=armature_poll,
+    )
+    copy_target_action: PointerProperty(
+        name="Target Action",
+        description="Action used as the destination or as the base for a new copy",
+        type=bpy.types.Action,
+    )
+    copy_output_mode: EnumProperty(
+        name="Action Output",
+        description="Choose whether to preserve the selected Target Action or modify it directly",
+        items=[
+            ('NEW', "New Action Copy", "Duplicate the Target Action, or create a new empty Action when none is selected"),
+            ('CURRENT', "Modify Target Action", "Write directly into the selected Target Action"),
+        ],
+        default='NEW',
+    )
+    copy_destinations: CollectionProperty(type=KTMRT_CopyDestinationItem)
+    copy_destination_index: IntProperty(default=0, min=0)
+    copy_status: StringProperty(default="")
+
+
+# -----------------------------------------------------------------------------
+# Presets
+# -----------------------------------------------------------------------------
+
+def preset_items(self, context):
+    global _PRESET_ITEMS_CACHE
+    migrate_legacy_retarget_presets()
+    path = preset_directory(create=False)
+    items = []
+    try:
+        names = sorted(
+            name for name in os.listdir(path)
+            if name.lower().endswith('.json')
+        )
+    except Exception:
+        names = []
+
+    for index, filename in enumerate(names):
+        stem = os.path.splitext(filename)[0]
+        items.append((filename, stem, os.path.join(path, filename), index))
+
+    if not items:
+        items = [("__NONE__", "No presets", "No JSON presets found", 0)]
+
+    _PRESET_ITEMS_CACHE = items
+    return _PRESET_ITEMS_CACHE
+
+
+def refresh_preset_cache():
+    global _PRESET_ITEMS_CACHE
+    _PRESET_ITEMS_CACHE = []
+
+
+# -----------------------------------------------------------------------------
+# UI list
+# -----------------------------------------------------------------------------
+
+class KTMRT_UL_Mappings(UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        settings = context.scene.kt_mrt_settings
+        target = settings.target_armature
+
+        row = layout.row(align=True)
+        # Compact hierarchy marker. Deep chains are capped so the bone name stays readable.
+        depth = item.hierarchy_depth
+        if depth <= 0:
+            marker = ""
+        elif depth == 1:
+            marker = "|"
+        elif depth == 2:
+            marker = "--"
+        else:
+            marker = "----"
+        source_label = f"{marker}{item.source_bone}"
+
+        left = row.row(align=True)
+        left.scale_x = 1.15
+        left.label(text=source_label)
+
+        target_row = row.row(align=True)
+        target_row.scale_x = 1.0
+        if target and target.type == 'ARMATURE':
+            target_row.prop_search(item, "target_bone", target.data, "bones", text="")
+        else:
+            target_row.prop(item, "target_bone", text="")
+
+        clear = row.operator("kt_mrt.clear_mapping", text="", icon='X')
+        clear.index = index
+
+        row.prop(item, "copy_rotation", text="R", toggle=True)
+        row.prop(item, "copy_location", text="L", toggle=True)
+        row.prop(item, "copy_scale", text="S", toggle=True)
+
+        if item.confidence < 0.0:
+            row.label(text="Manual")
+        elif item.target_bone:
+            row.label(text=f"{round(item.confidence * 100):d}%")
+        else:
+            row.label(text="--")
+
+    def filter_items(self, context, data, propname):
+        settings = context.scene.kt_mrt_settings
+        items = getattr(data, propname)
+        helper = bpy.types.UI_UL_list
+
+        flags = [self.bitflag_filter_item] * len(items)
+
+        for i, item in enumerate(items):
+            visible = True
+            if settings.filter_mode == 'ALL':
+                visible = item.motion_detected or item.direct_keyed or item.importance > 0.0
+            elif settings.filter_mode == 'SIGNIFICANT':
+                visible = item.significant
+            elif settings.filter_mode == 'UNMAPPED':
+                visible = not bool(item.target_bone)
+            elif settings.filter_mode == 'ALL_BONES':
+                visible = True
+
+            if not visible:
+                flags[i] &= ~self.bitflag_filter_item
+
+        sort_data = []
+        for i, item in enumerate(items):
+            if settings.sort_mode == 'IMPORTANCE':
+                key = (-item.importance, item.hierarchy_index, item.source_bone.lower())
+            elif settings.sort_mode == 'HIERARCHY':
+                key = (item.hierarchy_index,)
+            elif settings.sort_mode == 'NAME':
+                key = (item.source_bone.lower(),)
+            else:  # CONFIDENCE
+                conf = item.confidence if item.confidence >= 0.0 else 2.0
+                key = (-conf, -item.importance, item.source_bone.lower())
+            sort_data.append((i, key))
+
+        neworder = helper.sort_items_helper(sort_data, key=lambda e: e[1]) if sort_data else []
+        return flags, neworder
+
+
+# -----------------------------------------------------------------------------
+# Context / action assignment helpers
+# -----------------------------------------------------------------------------
+
+def ensure_source_action(settings):
+    source = settings.source_armature
+    if not source:
+        return None
+    if settings.source_action:
+        return settings.source_action
+    if source.animation_data and source.animation_data.action:
+        settings.source_action = source.animation_data.action
+        return settings.source_action
+    return None
+
+
+def set_action(obj, action):
+    anim_data = obj.animation_data_create()
+    anim_data.action = action
+
+
+def reset_mapped_target_pose(settings):
+    target = settings.target_armature
+    if not target:
+        return
+    for item in settings.mappings:
+        if not item.target_bone:
+            continue
+        pb = target.pose.bones.get(item.target_bone)
+        if pb:
+            pb.matrix_basis = Matrix.Identity(4)
+
+
+def rotation_data_path(pose_bone):
+    if pose_bone.rotation_mode == 'QUATERNION':
+        return "rotation_quaternion"
+    if pose_bone.rotation_mode == 'AXIS_ANGLE':
+        return "rotation_axis_angle"
+    return "rotation_euler"
+
+
+def current_calibration_counts(settings):
+    """Return (V1.8 current references, mapped rows)."""
+    mapped = [item for item in settings.mappings if item.target_bone]
+    current = sum(1 for item in mapped if reference_is_current(item))
+    return current, len(mapped)
+
+
+def has_complete_reference_pose(settings):
+    current, mapped = current_calibration_counts(settings)
+    return bool(
+        mapped > 0
+        and current == mapped
+        and settings.reference_target_pose_snapshot
+    )
+
+
+def select_armature_pose_bone(context, rig, bone_name=None):
+    """Make rig active and enter Pose Mode; optionally select one pose bone."""
+    if not rig or rig.type != 'ARMATURE':
+        return False
+    try:
+        if context.object and context.object.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+    except Exception:
+        pass
+    try:
+        bpy.ops.object.select_all(action='DESELECT')
+    except Exception:
+        pass
+    rig.select_set(True)
+    context.view_layer.objects.active = rig
+    try:
+        bpy.ops.object.mode_set(mode='POSE')
+    except Exception:
+        return False
+
+    if bone_name:
+        try:
+            for pb in rig.pose.bones:
+                if hasattr(pb, "select"):
+                    pb.select = False
+                elif hasattr(pb.bone, "select"):
+                    pb.bone.select = False
+            pb = rig.pose.bones.get(bone_name)
+            if pb:
+                if hasattr(pb, "select"):
+                    pb.select = True
+                elif hasattr(pb.bone, "select"):
+                    pb.bone.select = True
+                rig.data.bones.active = pb.bone
+        except Exception:
+            pass
+    return True
+
+
+# -----------------------------------------------------------------------------
+# Operators - convenience
+# -----------------------------------------------------------------------------
+
+class KTMRT_OT_UseSelectedSource(Operator):
+    bl_idname = "kt_mrt.use_selected_source"
+    bl_label = "Use Selected as Source"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        obj = context.active_object
+        if not obj or obj.type != 'ARMATURE':
+            self.report({'ERROR'}, "Select an armature")
+            return {'CANCELLED'}
+        settings = context.scene.kt_mrt_settings
+        settings.source_armature = obj
+        if obj.animation_data and obj.animation_data.action:
+            settings.source_action = obj.animation_data.action
+        return {'FINISHED'}
+
+
+class KTMRT_OT_UseSelectedTarget(Operator):
+    bl_idname = "kt_mrt.use_selected_target"
+    bl_label = "Use Selected as Target"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        obj = context.active_object
+        if not obj or obj.type != 'ARMATURE':
+            self.report({'ERROR'}, "Select an armature")
+            return {'CANCELLED'}
+        context.scene.kt_mrt_settings.target_armature = obj
+        return {'FINISHED'}
+
+
+class KTMRT_OT_ClearMapping(Operator):
+    bl_idname = "kt_mrt.clear_mapping"
+    bl_label = "Ignore Bone"
+    bl_options = {'INTERNAL'}
+
+    index: IntProperty()
+
+    def execute(self, context):
+        settings = context.scene.kt_mrt_settings
+        if 0 <= self.index < len(settings.mappings):
+            item = settings.mappings[self.index]
+            item.target_bone = IGNORE_MAPPING
+            item.manual_override = True
+            item.confidence = -1.0
+        return {'FINISHED'}
+
+
+class KTMRT_OT_ClearAllMappings(Operator):
+    bl_idname = "kt_mrt.clear_all_mappings"
+    bl_label = "Clear All"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        settings = context.scene.kt_mrt_settings
+        for item in settings.mappings:
+            item.target_bone = IGNORE_MAPPING
+            item.manual_override = True
+            item.confidence = -1.0
+        settings.status_message = "All mappings cleared"
+        return {'FINISHED'}
+
+
+# -----------------------------------------------------------------------------
+# Batch rename
+# -----------------------------------------------------------------------------
+
+class KTMRT_OT_UseSelectedRenameRig(Operator):
+    bl_idname = "kt_mrt.use_selected_rename_rig"
+    bl_label = "Use Selected Rig"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        obj = context.active_object
+        if not obj or obj.type != 'ARMATURE':
+            self.report({'ERROR'}, "Select an armature")
+            return {'CANCELLED'}
+        context.scene.kt_mrt_settings.rename_armature = obj
+        return {'FINISHED'}
+
+
+class KTMRT_OT_BatchRenameBones(Operator):
+    bl_idname = "kt_mrt.batch_rename_bones"
+    bl_label = "Rename Bones"
+    bl_description = "Batch find/replace bone names on the selected rig"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        settings = context.scene.kt_mrt_settings
+        rig = settings.rename_armature
+        find = settings.rename_find
+        replace = settings.rename_replace
+
+        if not rig or rig.type != 'ARMATURE':
+            self.report({'ERROR'}, "Choose an armature")
+            return {'CANCELLED'}
+        if not find:
+            self.report({'ERROR'}, "Find text cannot be empty")
+            return {'CANCELLED'}
+
+        changes = {}
+        all_names = {bone.name for bone in rig.data.bones}
+        for bone in rig.data.bones:
+            old = bone.name
+            mode = settings.rename_match_mode
+            if mode == 'PREFIX':
+                if not old.startswith(find):
+                    continue
+                new = replace + old[len(find):]
+            elif mode == 'SUFFIX':
+                if not old.endswith(find):
+                    continue
+                new = old[:-len(find)] + replace
+            else:
+                if find not in old:
+                    continue
+                new = old.replace(find, replace)
+
+            if new and new != old:
+                changes[old] = new
+
+        if not changes:
+            settings.rename_status = "No bone names matched"
+            self.report({'INFO'}, settings.rename_status)
+            return {'FINISHED'}
+
+        desired = list(changes.values())
+        if len(desired) != len(set(desired)):
+            self.report({'ERROR'}, "Rename would create duplicate bone names")
+            return {'CANCELLED'}
+
+        unchanged = all_names - set(changes.keys())
+        collisions = sorted(set(desired) & unchanged)
+        if collisions:
+            self.report({'ERROR'}, "Rename conflicts with existing bone: " + collisions[0])
+            return {'CANCELLED'}
+
+        # Temporary names avoid collisions during swaps/chained renames.
+        temp_map = {}
+        for index, old in enumerate(list(changes.keys())):
+            bone = rig.data.bones.get(old)
+            if not bone:
+                continue
+            temp = f"__KTMRT_TMP_{index:04d}__"
+            while rig.data.bones.get(temp):
+                temp += "_"
+            bone.name = temp
+            temp_map[temp] = changes[old]
+
+        for temp, final_name in temp_map.items():
+            bone = rig.data.bones.get(temp)
+            if bone:
+                bone.name = final_name
+
+        # Keep the current in-panel mapping consistent when renaming one of its rigs.
+        if rig == settings.source_armature:
+            inverse = changes
+            for item in settings.mappings:
+                if item.source_bone in inverse:
+                    item.source_bone = inverse[item.source_bone]
+        if rig == settings.target_armature:
+            inverse = changes
+            for item in settings.mappings:
+                if item.target_bone in inverse:
+                    item.target_bone = inverse[item.target_bone]
+
+        settings.rename_status = f"Renamed {len(changes)} bones"
+        self.report({'INFO'}, settings.rename_status)
+        return {'FINISHED'}
+
+
+# -----------------------------------------------------------------------------
+# Calibration / target IK
+# -----------------------------------------------------------------------------
+
+
+def _action_name(obj):
+    try:
+        action = obj.animation_data.action if obj and obj.animation_data else None
+        return action.name if action else ""
+    except Exception:
+        return ""
+
+
+def _action_from_name(name):
+    return bpy.data.actions.get(name) if name else None
+
+
+def _restore_calibration_state(context, settings):
+    source = settings.source_armature
+    target = settings.target_armature
+
+    if source:
+        set_action(source, _action_from_name(settings.calibration_source_action_name))
+        restore_pose_snapshot(source, settings.calibration_source_pose_snapshot)
+    if target:
+        set_action(target, _action_from_name(settings.calibration_target_action_name))
+        restore_pose_snapshot(target, settings.calibration_target_pose_snapshot)
+
+    try:
+        context.scene.frame_set(settings.calibration_frame)
+    except Exception:
+        pass
+    context.view_layer.update()
+
+    settings.calibration_mode = False
+    settings.calibration_source_action_name = ""
+    settings.calibration_target_action_name = ""
+    settings.calibration_source_pose_snapshot = ""
+    settings.calibration_target_pose_snapshot = ""
+
+
+class KTMRT_OT_ToggleCalibrationMode(Operator):
+    bl_idname = "kt_mrt.toggle_calibration_mode"
+    bl_label = "Calibration MODE"
+    bl_description = "Temporarily disable animation and prepare both rigs for an equivalent A/T reference pose"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        settings = context.scene.kt_mrt_settings
+        source = settings.source_armature
+        target = settings.target_armature
+
+        if settings.calibration_mode:
+            _restore_calibration_state(context, settings)
+            settings.status_message = "Calibration mode closed; animation restored"
+            self.report({'INFO'}, settings.status_message)
+            return {'FINISHED'}
+
+        if not source or not target:
+            self.report({'ERROR'}, "Choose Source and Target rigs first")
+            return {'CANCELLED'}
+        if source == target:
+            self.report({'ERROR'}, "Source and Target must be different rigs")
+            return {'CANCELLED'}
+        if not settings.mappings:
+            self.report({'ERROR'}, "Run Analyze Animation / mapping before calibration")
+            return {'CANCELLED'}
+        if not any(item.target_bone for item in settings.mappings):
+            self.report({'ERROR'}, "Map at least one bone before calibration")
+            return {'CANCELLED'}
+
+        settings.calibration_source_action_name = _action_name(source)
+        settings.calibration_target_action_name = _action_name(target)
+        settings.calibration_source_pose_snapshot = pose_snapshot(source)
+        settings.calibration_target_pose_snapshot = pose_snapshot(target)
+        settings.calibration_frame = context.scene.frame_current
+
+        # Remove active animation and start from each rig's own rest pose. The user then
+        # adjusts only the pose controls/bones needed to make the two characters visually
+        # equivalent (A/A or T/T). Rest pose data itself is never modified.
+        set_action(source, None)
+        set_action(target, None)
+        clear_pose_basis(source)
+        clear_pose_basis(target)
+        context.view_layer.update()
+
+        settings.calibration_mode = True
+
+        # Enter Pose Mode automatically on whichever calibration rig the user currently
+        # has selected. If neither is active, Target is the most useful default.
+        active = context.active_object
+        pose_rig = active if active in {source, target} else target
+        select_armature_pose_bone(context, pose_rig)
+
+        settings.status_message = "Calibration MODE: pose both rigs equivalently, then Capture Reference Pose"
+        self.report({'INFO'}, settings.status_message)
+        return {'FINISHED'}
+
+
+class KTMRT_OT_ClearCalibrationPose(Operator):
+    bl_idname = "kt_mrt.clear_calibration_pose"
+    bl_label = "Clear Calibration Pose"
+    bl_description = "Clear pose transforms without changing the armature rest pose"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    which: EnumProperty(
+        items=[
+            ('SOURCE', "Source", "Clear Source pose"),
+            ('TARGET', "Target", "Clear Target pose"),
+            ('BOTH', "Both", "Clear both poses"),
+        ],
+        default='BOTH',
+    )
+
+    def execute(self, context):
+        settings = context.scene.kt_mrt_settings
+        if not settings.calibration_mode:
+            self.report({'ERROR'}, "Enter Calibration MODE first")
+            return {'CANCELLED'}
+        if self.which in {'SOURCE', 'BOTH'}:
+            clear_pose_basis(settings.source_armature)
+        if self.which in {'TARGET', 'BOTH'}:
+            clear_pose_basis(settings.target_armature)
+        context.view_layer.update()
+        return {'FINISHED'}
+
+
+class KTMRT_OT_CaptureReferencePose(Operator):
+    bl_idname = "kt_mrt.capture_reference_pose"
+    bl_label = "Capture Reference Pose"
+    bl_description = "Capture the current equivalent Source/Target pose for every mapped bone"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        settings = context.scene.kt_mrt_settings
+        source = settings.source_armature
+        target = settings.target_armature
+        if not settings.calibration_mode:
+            self.report({'ERROR'}, "Enter Calibration MODE first")
+            return {'CANCELLED'}
+        if not source or not target:
+            self.report({'ERROR'}, "Source/Target missing")
+            return {'CANCELLED'}
+
+        context.view_layer.update()
+        count = 0
+        for item in settings.mappings:
+            if not item.target_bone:
+                item.has_reference = False
+                item.reference_source_matrix = ""
+                item.reference_target_matrix = ""
+                item.reference_space = ""
+                continue
+            src_pb = source.pose.bones.get(item.source_bone)
+            tgt_pb = target.pose.bones.get(item.target_bone)
+            if not src_pb or not tgt_pb:
+                item.has_reference = False
+                item.reference_source_matrix = ""
+                item.reference_target_matrix = ""
+                item.reference_space = ""
+                continue
+            item.reference_source_matrix = matrix_to_json(src_pb.matrix.copy())
+            item.reference_target_matrix = matrix_to_json(tgt_pb.matrix.copy())
+            item.reference_space = CURRENT_REFERENCE_SPACE
+            item.has_reference = True
+            count += 1
+
+        # Keep the complete Target calibration pose as the base for every baked frame.
+        # Without this, unmapped intermediary bones were reset to Rest Pose and could break
+        # rigs whose hierarchy differs from the source.
+        settings.reference_source_pose_snapshot = pose_snapshot(source)
+        settings.reference_target_pose_snapshot = pose_snapshot(target)
+        settings.calibration_count = count
+        settings.has_calibration = count > 0
+        settings.status_message = f"Reference pose captured for {count} mapped rows (V1.8 hierarchy-aware)"
+        self.report({'INFO'}, settings.status_message)
+        return {'FINISHED'}
+
+
+class KTMRT_OT_ClearReferencePose(Operator):
+    bl_idname = "kt_mrt.clear_reference_pose"
+    bl_label = "Clear Reference"
+    bl_description = "Remove captured calibration reference data"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        settings = context.scene.kt_mrt_settings
+        for item in settings.mappings:
+            item.has_reference = False
+            item.reference_source_matrix = ""
+            item.reference_target_matrix = ""
+            item.reference_space = ""
+        settings.has_calibration = False
+        settings.calibration_count = 0
+        settings.reference_source_pose_snapshot = ""
+        settings.reference_target_pose_snapshot = ""
+        settings.status_message = "Reference pose calibration cleared"
+        return {'FINISHED'}
+
+
+class KTMRT_OT_ToggleTargetIK(Operator):
+    bl_idname = "kt_mrt.toggle_target_ik"
+    bl_label = "Disable Target IK"
+    bl_description = "Mute/unmute IK constraints on the target rig without deleting them"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        settings = context.scene.kt_mrt_settings
+        target = settings.target_armature
+        if not target or target.type != 'ARMATURE':
+            self.report({'ERROR'}, "Choose a Target rig first")
+            return {'CANCELLED'}
+
+        if settings.ik_disabled:
+            try:
+                saved = json.loads(settings.ik_restore_state or "[]")
+            except Exception:
+                saved = []
+            restored = 0
+            for entry in saved:
+                pb = target.pose.bones.get(entry.get("bone", ""))
+                if not pb:
+                    continue
+                con = pb.constraints.get(entry.get("constraint", ""))
+                if not con:
+                    continue
+                if "mute" in entry and hasattr(con, "mute"):
+                    con.mute = bool(entry["mute"])
+                if "influence" in entry and hasattr(con, "influence"):
+                    con.influence = float(entry["influence"])
+                restored += 1
+            settings.ik_disabled = False
+            settings.ik_restore_state = ""
+            context.view_layer.update()
+            settings.status_message = f"Target IK restored ({restored} constraints)"
+            self.report({'INFO'}, settings.status_message)
+            return {'FINISHED'}
+
+        saved = []
+        disabled = 0
+        for pb in target.pose.bones:
+            for con in pb.constraints:
+                if con.type not in {'IK', 'SPLINE_IK'}:
+                    continue
+                entry = {"bone": pb.name, "constraint": con.name}
+                if hasattr(con, "mute"):
+                    entry["mute"] = bool(con.mute)
+                    con.mute = True
+                elif hasattr(con, "influence"):
+                    entry["influence"] = float(con.influence)
+                    con.influence = 0.0
+                saved.append(entry)
+                disabled += 1
+
+        settings.ik_restore_state = json.dumps(saved)
+        settings.ik_disabled = disabled > 0
+        context.view_layer.update()
+        if disabled:
+            settings.status_message = f"Target IK disabled ({disabled} constraints, not deleted)"
+            self.report({'INFO'}, settings.status_message)
+        else:
+            settings.status_message = "No IK constraints found on Target"
+            self.report({'INFO'}, settings.status_message)
+        return {'FINISHED'}
+
+
+# -----------------------------------------------------------------------------
+# Analyze
+# -----------------------------------------------------------------------------
+
+class KTMRT_OT_Analyze(Operator):
+    bl_idname = "kt_mrt.analyze"
+    bl_label = "Analyze Animation"
+    bl_description = "Evaluate the source Action and measure meaningful local bone motion"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        scene = context.scene
+        settings = scene.kt_mrt_settings
+        source = settings.source_armature
+        target = settings.target_armature
+        action = ensure_source_action(settings)
+
+        if not source or source.type != 'ARMATURE':
+            self.report({'ERROR'}, "Choose a source armature")
+            return {'CANCELLED'}
+        if not action:
+            self.report({'ERROR'}, "Choose a source Action")
+            return {'CANCELLED'}
+        if target and target == source:
+            self.report({'ERROR'}, "Source and target must be different armatures")
+            return {'CANCELLED'}
+
+        old_frame = scene.frame_current
+        old_action = source.animation_data.action if source.animation_data else None
+        keyed = keyed_bone_names(action)
+        order = hierarchy_order(source)
+        start, end = action_range(action)
+        frames = frame_sequence(start, end, settings.analysis_step)
+        source_height = armature_height(source)
+
+        metrics = {}
+        for pb in source.pose.bones:
+            metrics[pb.name] = {
+                "max_rot": 0.0,
+                "max_loc": 0.0,
+                "max_scale": 0.0,
+            }
+
+        try:
+            set_action(source, action)
+
+            for frame in frames:
+                scene.frame_set(frame)
+                context.view_layer.update()
+
+                for pb in source.pose.bones:
+                    delta = evaluated_rest_delta(pb)
+                    loc, rot, scale, rot_deg, scale_dev = matrix_motion_components(delta)
+                    data = metrics[pb.name]
+                    data["max_rot"] = max(data["max_rot"], rot_deg)
+                    data["max_loc"] = max(data["max_loc"], loc.length)
+                    data["max_scale"] = max(data["max_scale"], scale_dev)
+
+        except Exception as exc:
+            self.report({'ERROR'}, f"Analysis failed: {exc}")
+            return {'CANCELLED'}
+        finally:
+            set_action(source, old_action)
+            scene.frame_set(old_frame)
+            context.view_layer.update()
+
+        records = []
+        moving_count = 0
+
+        for bone in source.data.bones:
+            data = metrics.get(bone.name)
+            if not data:
+                data = {
+                    "max_rot": 0.0,
+                    "max_loc": 0.0,
+                    "max_scale": 0.0,
+                }
+
+            bone_ref = max(bone.length, source_height * 0.01, 1e-6)
+            loc_ratio = data["max_loc"] / bone_ref
+            score = (
+                data["max_rot"] +
+                min(loc_ratio * 45.0, 180.0) +
+                min(data["max_scale"] * 50.0, 100.0)
+            )
+
+            # A bone is considered animated when it has measurable evaluated motion
+            # or direct keys. Every bone is still stored so the All Bones filter can
+            # expose static/helper bones for manual mapping when needed.
+            motion_detected = score > 0.01 or bone.name in keyed
+            if motion_detected:
+                moving_count += 1
+
+            records.append((bone, data, score, motion_detected))
+
+        settings.mappings.clear()
+        settings.has_calibration = False
+        settings.calibration_count = 0
+        settings.reference_source_pose_snapshot = ""
+        settings.reference_target_pose_snapshot = ""
+
+        if not records:
+            settings.analyzed = False
+            settings.status_message = "Source armature has no bones"
+            self.report({'WARNING'}, settings.status_message)
+            return {'FINISHED'}
+
+        motion_scores = [
+            score for _bone, _data, score, moving in records
+            if moving
+        ]
+        max_score = max(motion_scores, default=1.0)
+        sig_cutoff = max(max_score * settings.significance_ratio, 0.5)
+
+        for bone, data, score, motion_detected in records:
+            item = settings.mappings.add()
+            item.source_bone = bone.name
+            item.target_bone = ""
+            item.hierarchy_depth = hierarchy_depth(bone)
+            item.hierarchy_index = order.get(bone.name, 0)
+            item.max_rotation_deg = data["max_rot"]
+            item.max_location = data["max_loc"]
+            item.max_scale_deviation = data["max_scale"]
+            item.importance = score / max(max_score, 1e-6) if motion_detected else 0.0
+            item.direct_keyed = bone.name in keyed
+            item.motion_detected = motion_detected
+            item.significant = motion_detected and score >= sig_cutoff
+            cls = bone_class(bone.name)
+            # A dedicated Root is treated only as global translation/root motion.
+            # Hips/Pelvis is part of the body and normally carries both rotation and location.
+            item.copy_rotation = (cls != "root")
+            item.copy_location = cls in {"root", "hips"}
+            item.copy_scale = False
+            item.manual_override = False
+            item.confidence = 0.0
+
+        settings.analysis_start = start
+        settings.analysis_end = end
+        settings.analyzed = True
+        settings.show_setup = False
+        settings.show_mapping = True
+        significant_count = sum(1 for item in settings.mappings if item.significant)
+        settings.status_message = (
+            f"Analyzed {len(frames)} frames · {moving_count} moving/keyed / "
+            f"{len(settings.mappings)} total bones · {significant_count} significant"
+        )
+        settings.validation_report = ""
+
+        # Auto-map immediately if a target is already selected.
+        if target and target.type == 'ARMATURE':
+            bpy.ops.mrt.auto_map()
+
+        self.report({'INFO'}, settings.status_message)
+        return {'FINISHED'}
+
+
+# -----------------------------------------------------------------------------
+# Auto map
+# -----------------------------------------------------------------------------
+
+class KTMRT_OT_AutoMap(Operator):
+    bl_idname = "kt_mrt.auto_map"
+    bl_label = "Auto Map"
+    bl_description = "Suggest target bones using names, side, hierarchy, bone type and channel compatibility"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    only_unmapped: BoolProperty(default=False)
+
+    def execute(self, context):
+        settings = context.scene.kt_mrt_settings
+        source = settings.source_armature
+        target = settings.target_armature
+
+        if not source or not target:
+            self.report({'ERROR'}, "Choose source and target armatures")
+            return {'CANCELLED'}
+        if not settings.mappings:
+            self.report({'ERROR'}, "Analyze the source Action first")
+            return {'CANCELLED'}
+
+        target_depths = {b.name: hierarchy_depth(b) for b in target.data.bones}
+        used_channels = {}
+
+        def reserve(item):
+            if item.target_bone:
+                used_channels.setdefault(item.target_bone, set()).update(mapping_channels(item))
+
+        # Preserve manual decisions first. Different source rows may share one target as long
+        # as they do not write the same transform channel.
+        for item in settings.mappings:
+            if item.target_bone and item.manual_override:
+                reserve(item)
+
+        reserved_sources = set()
+
+        # Root and Hips are intentionally treated as different functions.
+        # Root = optional global translation/root motion. It is NEVER auto-mapped to Hips.
+        # Hips/Pelvis = anatomical body bone and normally carries both Rotation + Location.
+        source_roots = [
+            it for it in settings.mappings
+            if bone_class(it.source_bone) == 'root'
+            and (it.motion_detected or it.manual_override or bool(it.target_bone))
+        ]
+        source_hips = [
+            it for it in settings.mappings
+            if bone_class(it.source_bone) == 'hips'
+            and (it.motion_detected or it.manual_override or bool(it.target_bone))
+        ]
+        target_roots = [b for b in target.data.bones if bone_class(b.name) == 'root']
+        target_hips = [b for b in target.data.bones if bone_class(b.name) == 'hips']
+
+        ignored_root_sources = set()
+
+        # Dedicated Root only maps to a dedicated Root. If Target has none, leave it ignored.
+        if source_roots:
+            for root_item in source_roots:
+                if root_item.manual_override:
+                    if root_item.target_bone:
+                        reserve(root_item)
+                    continue
+                root_item.copy_rotation = False
+                root_item.copy_location = True
+                root_item.copy_scale = False
+                if target_roots:
+                    root_target = max(
+                        target_roots,
+                        key=lambda b: bone_match_score(
+                            root_item.source_bone, b.name, root_item.hierarchy_depth, target_depths[b.name]
+                        ),
+                    )
+                    root_item.target_bone = root_target.name
+                    root_item.confidence = max(
+                        bone_match_score(
+                            root_item.source_bone, root_target.name,
+                            root_item.hierarchy_depth, target_depths[root_target.name]
+                        ),
+                        0.90,
+                    )
+                    root_item.manual_override = False
+                    reserve(root_item)
+                    reserved_sources.add(root_item.source_bone)
+                else:
+                    root_item.target_bone = ""
+                    root_item.confidence = 0.0
+                    root_item.manual_override = False
+                    ignored_root_sources.add(root_item.source_bone)
+                    reserved_sources.add(root_item.source_bone)
+
+        # Hips/Pelvis maps to Hips/Pelvis and owns BOTH Rotation and Location by default.
+        if source_hips and target_hips:
+            for hips_item in source_hips:
+                if hips_item.manual_override:
+                    if hips_item.target_bone:
+                        reserve(hips_item)
+                    continue
+                hip_target = max(
+                    target_hips,
+                    key=lambda b: bone_match_score(
+                        hips_item.source_bone, b.name, hips_item.hierarchy_depth, target_depths[b.name]
+                    ),
+                )
+                hips_item.target_bone = hip_target.name
+                hips_item.copy_rotation = True
+                hips_item.copy_location = True
+                hips_item.copy_scale = False
+                hips_item.manual_override = False
+                hips_item.confidence = max(
+                    bone_match_score(
+                        hips_item.source_bone, hip_target.name,
+                        hips_item.hierarchy_depth, target_depths[hip_target.name]
+                    ),
+                    0.90,
+                )
+                reserve(hips_item)
+                reserved_sources.add(hips_item.source_bone)
+
+        # Main motion first so important bones get first choice.
+        rows = sorted(settings.mappings, key=lambda item: (-item.importance, item.hierarchy_index))
+        mapped_count = 0
+
+        for item in rows:
+            if item.source_bone in reserved_sources:
+                mapped_count += 1
+                continue
+
+            # Static bones are available in Show > All Bones for manual mapping,
+            # but Auto Map deliberately ignores them to avoid clutter and constant curves.
+            if not (item.motion_detected or item.direct_keyed or item.importance > 0.0) and not item.manual_override:
+                continue
+
+            if self.only_unmapped and item.target_bone:
+                reserve(item)
+                continue
+            if item.manual_override and item.target_bone:
+                continue
+
+            required_channels = mapping_channels(item)
+            if not required_channels:
+                continue
+
+            best_name = ""
+            best_score = 0.0
+            for target_bone in target.data.bones:
+                # Sharing a target is legal if this row controls different channels.
+                if required_channels & used_channels.get(target_bone.name, set()):
+                    continue
+                score = bone_match_score(
+                    item.source_bone,
+                    target_bone.name,
+                    item.hierarchy_depth,
+                    target_depths[target_bone.name],
+                )
+                if score > best_score:
+                    best_score = score
+                    best_name = target_bone.name
+
+            if best_score >= settings.automap_threshold:
+                item.target_bone = best_name
+                item.manual_override = False
+                item.confidence = best_score
+                reserve(item)
+                mapped_count += 1
+            else:
+                item.target_bone = ""
+                item.manual_override = False
+                item.confidence = best_score
+
+        settings.status_message = f"Auto-mapped {mapped_count} bones"
+        if ignored_root_sources:
+            settings.status_message += " · Source Root ignored (Target has no Root)"
+        elif source_roots and target_roots:
+            settings.status_message += " · Root mapped only to Root"
+        if source_hips and target_hips:
+            settings.status_message += " · Hips uses Rot + Loc"
+        self.report({'INFO'}, settings.status_message)
+        return {'FINISHED'}
+
+
+# -----------------------------------------------------------------------------
+# Validation
+# -----------------------------------------------------------------------------
+
+def build_validation_report(settings):
+    source = settings.source_armature
+    target = settings.target_armature
+    action = ensure_source_action(settings)
+    lines = []
+    has_error = False
+
+    if not source:
+        return "ERROR: Source rig is not set", True
+    if not target:
+        return "ERROR: Target rig is not set", True
+    if source == target:
+        return "ERROR: Source and target are the same object", True
+    if not action:
+        return "ERROR: Source Action is not set", True
+    if not settings.mappings:
+        return "ERROR: Run Analyze Animation first", True
+    if settings.calibration_mode:
+        return "ERROR: Exit Calibration MODE before Validate/Preview/Bake", True
+
+    valid_target_names = {b.name for b in target.data.bones}
+    mapped = [item for item in settings.mappings if item.target_bone]
+    invalid = [item for item in mapped if item.target_bone not in valid_target_names]
+    no_channels = [item for item in mapped if not mapping_channels(item)]
+
+    significant = [item for item in settings.mappings if item.significant]
+    unmapped_significant = [item for item in significant if not item.target_bone]
+    target_has_global_root = any(bone_class(b.name) == "root" for b in target.data.bones)
+    ignored_global_roots = [
+        item for item in unmapped_significant
+        if bone_class(item.source_bone) == "root" and not target_has_global_root
+    ]
+    optional_unmapped = [
+        item for item in unmapped_significant
+        if bone_class(item.source_bone) in {"finger", "thumb", "toe"}
+    ]
+    non_optional = [
+        item for item in unmapped_significant
+        if item not in optional_unmapped and item not in ignored_global_roots
+    ]
+    chain_absorbed = [
+        item for item in non_optional
+        if skipped_chain_is_absorbed(item, settings, source)
+    ]
+    core_unmapped = [item for item in non_optional if item not in chain_absorbed]
+
+    # Same target is allowed, but each actual destination channel may only have one source.
+    # Root/Hips Location can be routed to a different target bone than Rotation.
+    target_channel_sources = {}
+    routed_locations = []
+    for item in mapped:
+        for channel in mapping_channels(item):
+            destination = item.target_bone
+            if channel == 'L':
+                destination = resolve_root_motion_target_name(settings, target, item)
+                if destination != item.target_bone:
+                    routed_locations.append((item.source_bone, destination, item.target_bone))
+            target_channel_sources.setdefault((destination, channel), []).append(item.source_bone)
+    conflicts = {
+        key: names for key, names in target_channel_sources.items()
+        if len(names) > 1
+    }
+
+    opposite_side = []
+    for item in mapped:
+        ss = detect_side(item.source_bone)
+        ts = detect_side(item.target_bone)
+        if ss in {'L', 'R'} and ts in {'L', 'R'} and ss != ts:
+            opposite_side.append(f"{item.source_bone} -> {item.target_bone}")
+
+    constrained = set()
+    for item in mapped:
+        pb = target.pose.bones.get(item.target_bone)
+        if pb and any(con.type not in {'IK', 'SPLINE_IK'} for con in pb.constraints):
+            constrained.add(pb.name)
+
+    lines.append(f"OK: {len(mapped)} mapped / {len(settings.mappings)} analyzed bones")
+    calibrated_rows = sum(1 for item in mapped if reference_is_current(item))
+    legacy_reference_rows = sum(
+        1 for item in mapped
+        if item.has_reference and item.reference_space != CURRENT_REFERENCE_SPACE
+    )
+    if calibrated_rows:
+        lines.append(f"OK: V1.8 Reference Pose available for {calibrated_rows} mapped rows")
+    if legacy_reference_rows:
+        lines.append(f"WARNING: {legacy_reference_rows} calibration rows use an older format; recapture Calibration MODE")
+    if not calibrated_rows and not legacy_reference_rows:
+        lines.append("INFO: No captured reference pose; native Rest Pose conversion will be used")
+
+    if routed_locations:
+        unique_routes = []
+        seen = set()
+        for source_name, destination, rot_target in routed_locations:
+            key = (source_name, destination, rot_target)
+            if key not in seen:
+                seen.add(key)
+                unique_routes.append(key)
+        for source_name, destination, rot_target in unique_routes[:4]:
+            lines.append(f"INFO: {source_name} Loc -> {destination}; Rot -> {rot_target}")
+
+    if settings.root_motion_mode == 'CUSTOM':
+        custom = settings.root_motion_target
+        if not custom or custom not in valid_target_names:
+            has_error = True
+            lines.append("ERROR: Custom Root Motion Bone is empty or missing")
+
+    ik_active = active_ik_constraints(target)
+    if ik_active:
+        has_error = True
+        lines.append(f"ERROR: {len(ik_active)} active Target IK constraint(s); press Disable Target IK before Preview/Bake")
+        lines.append("  " + ", ".join(f"{bone}:{name}" for bone, name in ik_active[:5]))
+    elif settings.ik_disabled:
+        lines.append("INFO: Target IK constraints are currently disabled")
+
+    core_significant_count = len(significant) - len(optional_unmapped) - len(ignored_global_roots)
+    core_mapped_count = core_significant_count - len(core_unmapped) - len(chain_absorbed)
+    lines.append(f"OK: {core_mapped_count} direct core mappings")
+
+    if invalid:
+        has_error = True
+        lines.append(f"ERROR: {len(invalid)} mappings point to missing target bones")
+
+    if conflicts:
+        has_error = True
+        lines.append(f"ERROR: {len(conflicts)} target channels receive more than one source")
+        channel_labels = {'R': 'Rot', 'L': 'Loc', 'S': 'Scale'}
+        for (target_name, channel), names in list(conflicts.items())[:6]:
+            lines.append(f"  {target_name} {channel_labels[channel]} <- {', '.join(names)}")
+
+    shared_targets = {}
+    for item in mapped:
+        shared_targets.setdefault(item.target_bone, []).append(item)
+    valid_shared = [
+        name for name, rows in shared_targets.items()
+        if len(rows) > 1 and not any((name, ch) in conflicts for ch in {'R', 'L', 'S'})
+    ]
+    if valid_shared:
+        lines.append(f"INFO: {len(valid_shared)} target bones use channel-split mappings")
+
+    if opposite_side:
+        lines.append(f"WARNING: {len(opposite_side)} left/right mappings look reversed")
+        lines.extend("  " + value for value in opposite_side[:4])
+
+    if core_unmapped:
+        lines.append(f"WARNING: {len(core_unmapped)} core significant bones are ignored")
+        lines.append("  " + ", ".join(item.source_bone for item in core_unmapped[:8]))
+
+    if chain_absorbed:
+        lines.append(f"INFO: {len(chain_absorbed)} skipped source-chain bones are absorbed downstream")
+        lines.append("  " + ", ".join(item.source_bone for item in chain_absorbed[:8]))
+
+    if ignored_global_roots:
+        lines.append(
+            f"INFO: {len(ignored_global_roots)} Source Root bone(s) ignored because Target has no dedicated Root"
+        )
+        lines.append("  Hips Location can still be routed to the Target root parent in Auto Parent mode")
+
+    if optional_unmapped:
+        lines.append(f"INFO: {len(optional_unmapped)} optional finger/toe bones are ignored")
+        lines.append("  " + ", ".join(item.source_bone for item in optional_unmapped[:8]))
+
+    if no_channels:
+        lines.append(f"WARNING: {len(no_channels)} mapped rows have Rot/Loc/Scale all disabled")
+
+    if constrained:
+        lines.append(f"WARNING: {len(constrained)} mapped target bones have non-IK constraints")
+        lines.append("  Constraints can modify the baked pose after retargeting")
+
+    if not has_error and not mapped:
+        has_error = True
+        lines.append("ERROR: Nothing is mapped")
+
+    if calibrated_rows and calibrated_rows != len(mapped):
+        lines.append("WARNING: Calibration is partial; recapture after finishing the mapping")
+
+    if not has_error:
+        lines.append("READY: Retarget can be baked")
+
+    return "\n".join(lines), has_error
+
+
+class KTMRT_OT_DebugSelectedMapping(Operator):
+    bl_idname = "kt_mrt.debug_selected_mapping"
+    bl_label = "Debug Selected"
+    bl_description = "Show rest/reference orientation information for the selected mapping"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        settings = context.scene.kt_mrt_settings
+        if not settings.mappings:
+            self.report({'ERROR'}, "No mapping rows")
+            return {'CANCELLED'}
+        idx = max(0, min(settings.active_mapping_index, len(settings.mappings) - 1))
+        item = settings.mappings[idx]
+        source = settings.source_armature
+        target = settings.target_armature
+        if not source or not target or not item.target_bone:
+            self.report({'ERROR'}, "Select a mapped row first")
+            return {'CANCELLED'}
+        src_pb = source.pose.bones.get(item.source_bone)
+        tgt_pb = target.pose.bones.get(item.target_bone)
+        if not src_pb or not tgt_pb:
+            self.report({'ERROR'}, "Mapped bone not found")
+            return {'CANCELLED'}
+
+        src_rest = src_pb.bone.matrix_local.copy()
+        tgt_rest = tgt_pb.bone.matrix_local.copy()
+        src_pose = src_pb.matrix.copy()
+        src_rest_q = src_rest.to_quaternion()
+        tgt_rest_q = tgt_rest.to_quaternion()
+        src_pose_q = src_pose.to_quaternion()
+        align_q = tgt_rest_q @ src_rest_q.inverted()
+        source_motion_q = src_pose_q @ src_rest_q.inverted()
+        source_local_q = src_rest_q.inverted() @ src_pose_q
+
+        src_dir = (src_rest.to_3x3() @ Vector((0.0, 1.0, 0.0))).normalized()
+        tgt_dir = (tgt_rest.to_3x3() @ Vector((0.0, 1.0, 0.0))).normalized()
+        dot = max(-1.0, min(1.0, src_dir.dot(tgt_dir)))
+        axis_angle = math.degrees(math.acos(dot))
+
+        lines = [
+            f"{item.source_bone} -> {item.target_bone}",
+            f"Rest direction difference: {axis_angle:.2f} deg",
+            f"Rest alignment rotation: {shortest_angle_deg(align_q):.2f} deg",
+            f"Source world delta: {shortest_angle_deg(source_motion_q):.2f} deg",
+            f"Source rest-local delta: {shortest_angle_deg(source_local_q):.2f} deg",
+            f"Fallback Rotation Space: {settings.rotation_mode}",
+            f"Source parent: {src_pb.parent.name if src_pb.parent else '(none)'}",
+            f"Target parent: {tgt_pb.parent.name if tgt_pb.parent else '(none)'}",
+        ]
+
+        reference_is_current = item.has_reference and reference_is_compatible(item)
+        src_ref = matrix_from_json(item.reference_source_matrix) if reference_is_current else None
+        tgt_ref = matrix_from_json(item.reference_target_matrix) if reference_is_current else None
+        if src_ref is not None and tgt_ref is not None:
+            src_ref_q = src_ref.to_quaternion()
+            tgt_ref_q = tgt_ref.to_quaternion()
+            # Reference transfer used by Preview/Bake (V1.8 also bridges armature object axes).
+            ref_armature_delta = src_pose_q @ src_ref_q.inverted()
+            bridge_q = armature_axis_bridge(source, target)
+            target_armature_delta = bridge_q @ ref_armature_delta @ bridge_q.inverted()
+            predicted_target_q = target_armature_delta @ tgt_ref_q
+            # Keep the old local-order value in the report so problematic rigs can be compared.
+            old_local_order_q = tgt_ref_q @ src_ref_q.inverted() @ src_pose_q
+            src_ref_dir = (src_ref.to_3x3() @ Vector((0.0, 1.0, 0.0))).normalized()
+            tgt_ref_dir = (tgt_ref.to_3x3() @ Vector((0.0, 1.0, 0.0))).normalized()
+            ref_dot = max(-1.0, min(1.0, src_ref_dir.dot(tgt_ref_dir)))
+            lines.extend([
+                "Reference Pose: CAPTURED (armature-space)",
+                f"Reference direction difference: {math.degrees(math.acos(ref_dot)):.2f} deg",
+                f"Source armature delta: {shortest_angle_deg(ref_armature_delta):.2f} deg",
+                f"Predicted target rotation: {shortest_angle_deg(predicted_target_q):.2f} deg",
+                f"Old local-order result: {shortest_angle_deg(old_local_order_q):.2f} deg",
+                "Reference transfer: AXIS-BRIDGED ARMATURE DELTA (V1.8)",
+            ])
+        elif item.has_reference:
+            lines.append("Reference Pose: OLD FORMAT - recapture calibration in V1.8")
+        else:
+            lines.append("Reference Pose: not captured for this row")
+
+        settings.debug_report = "\n".join(lines)
+        settings.show_debug = True
+        return {'FINISHED'}
+
+
+class KTMRT_OT_Validate(Operator):
+    bl_idname = "kt_mrt.validate"
+    bl_label = "Validate"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        settings = context.scene.kt_mrt_settings
+        report, has_error = build_validation_report(settings)
+        settings.validation_report = report
+        settings.show_validation_log = True
+        settings.status_message = "Validation found errors" if has_error else "Validation complete"
+        if has_error:
+            self.report({'WARNING'}, "Validation found errors")
+        else:
+            self.report({'INFO'}, "Validation complete")
+        return {'FINISHED'}
+
+
+# -----------------------------------------------------------------------------
+# Retarget bake
+# -----------------------------------------------------------------------------
+
+def create_retarget_action(context, preview=False):
+    scene = context.scene
+    settings = scene.kt_mrt_settings
+    source = settings.source_armature
+    target = settings.target_armature
+    action = ensure_source_action(settings)
+
+    report, has_error = build_validation_report(settings)
+    settings.validation_report = report
+    if has_error:
+        raise RuntimeError("Validation contains errors")
+
+    mappings = [
+        item for item in settings.mappings
+        if item.target_bone and target.pose.bones.get(item.target_bone) and source.pose.bones.get(item.source_bone)
+    ]
+    if not mappings:
+        raise RuntimeError("No valid mappings to bake")
+
+    start, end = action_range(action)
+    frames = frame_sequence(start, end, settings.bake_step)
+    # PoseBone translations live in armature-local units. A world-height ratio can be wildly
+    # wrong for FBX rigs with object scale 0.01, so derive the conversion from mapped local
+    # bone lengths instead.
+    root_scale = mapped_character_scale(source, target, mappings) if settings.scale_root_translation else 1.0
+
+    old_frame = scene.frame_current
+    old_source_action = source.animation_data.action if source.animation_data else None
+    old_target_action = target.animation_data.action if target.animation_data else None
+
+    old_preview_to_remove = None
+    if preview and old_target_action and old_target_action.get("motion_retarget_preview", False):
+        old_preview_to_remove = old_target_action
+
+    target.animation_data_create()
+    target.animation_data.action = None
+
+    created_action = None
+    complete_reference = has_complete_reference_pose(settings)
+    bridge_q = armature_axis_bridge(source, target)
+
+    # Build groups once; they do not change from frame to frame.
+    groups = {}
+    for item in mappings:
+        groups.setdefault(item.target_bone, []).append(item)
+    ordered_targets = sorted(
+        groups.keys(),
+        key=lambda name: hierarchy_depth(target.data.bones[name]),
+    )
+
+    # Root/Hips Location is evaluated separately so it can drive a dedicated parent/root
+    # while Rotation remains on the anatomical mapped bone.
+    root_location_items = [
+        item for item in mappings
+        if item.copy_location and bone_class(item.source_bone) in {'root', 'hips'}
+    ]
+
+    try:
+        set_action(source, action)
+
+        for frame in frames:
+            scene.frame_set(frame)
+            context.view_layer.update()
+
+            # Start from the captured equivalent Target pose when the calibration is complete.
+            # This preserves unmapped intermediary/helper bones instead of silently putting them
+            # back into Rest Pose every frame.
+            if complete_reference:
+                restore_pose_snapshot(target, settings.reference_target_pose_snapshot)
+            else:
+                clear_pose_basis(target)
+            context.view_layer.update()
+
+            # -------------------------------------------------------------
+            # 1) ROOT MOTION / HIPS LOCATION
+            # -------------------------------------------------------------
+            for item in root_location_items:
+                src_pb = source.pose.bones[item.source_bone]
+                destination_name = resolve_root_motion_target_name(settings, target, item)
+                dst_pb = target.pose.bones.get(destination_name)
+                if not dst_pb:
+                    continue
+
+                current_armature = dst_pb.matrix.copy()
+                cur_loc, cur_rot, cur_scale = current_armature.decompose()
+
+                if reference_is_compatible(item):
+                    src_reference = matrix_from_json(item.reference_source_matrix)
+                else:
+                    src_reference = src_pb.bone.matrix_local.copy()
+
+                if src_reference is None:
+                    continue
+
+                src_delta = src_pb.matrix.translation - src_reference.translation
+                src_delta = bridge_q @ src_delta
+                loc_scale = mapped_location_scale(
+                    source, src_pb, target, dst_pb,
+                    global_root_scale=root_scale,
+                )
+                out_loc = cur_loc + src_delta * loc_scale
+                dst_pb.matrix = Matrix.LocRotScale(out_loc, cur_rot, cur_scale)
+                context.view_layer.update()
+                dst_pb.keyframe_insert(data_path="location", frame=frame, group=dst_pb.name)
+
+            # -------------------------------------------------------------
+            # 2) ROTATION / NON-ROOT CHANNELS
+            # -------------------------------------------------------------
+            for target_name in ordered_targets:
+                tgt_pb = target.pose.bones[target_name]
+                current_armature = tgt_pb.matrix.copy()
+                current_world = bone_world_pose_matrix(target, tgt_pb)
+                out_loc, out_rot, out_scale = current_world.decompose()
+                key_loc = False
+                key_rot = False
+                key_scale = False
+
+                for item in groups[target_name]:
+                    src_pb = source.pose.bones[item.source_bone]
+                    is_root_location = item.copy_location and bone_class(item.source_bone) in {'root', 'hips'}
+                    # Root/Hips location was already applied to its resolved destination above.
+                    copy_location_here = item.copy_location and not is_root_location
+
+                    reference_is_valid = reference_is_compatible(item)
+                    src_reference = matrix_from_json(item.reference_source_matrix) if reference_is_valid else None
+                    tgt_reference = matrix_from_json(item.reference_target_matrix) if reference_is_valid else None
+
+                    if src_reference is not None and tgt_reference is not None:
+                        desired_armature = calibrated_target_matrix(
+                            source, src_pb, target, tgt_pb,
+                            current_armature,
+                            src_reference, tgt_reference,
+                            copy_location=copy_location_here,
+                            copy_rotation=item.copy_rotation,
+                            copy_scale=item.copy_scale,
+                            global_root_scale=root_scale,
+                        )
+                    else:
+                        desired_armature = world_aligned_target_matrix(
+                            source, src_pb, target, tgt_pb,
+                            current_world,
+                            copy_location=copy_location_here,
+                            copy_rotation=item.copy_rotation,
+                            copy_scale=item.copy_scale,
+                            global_root_scale=root_scale,
+                            rotation_mode=settings.rotation_mode,
+                        )
+
+                    desired_world = target.matrix_world @ desired_armature
+                    d_loc, d_rot, d_scale = desired_world.decompose()
+
+                    if copy_location_here:
+                        out_loc = d_loc
+                        key_loc = True
+                    if item.copy_rotation:
+                        out_rot = d_rot
+                        key_rot = True
+                    if item.copy_scale:
+                        out_scale = d_scale
+                        key_scale = True
+
+                final_world = Matrix.LocRotScale(out_loc, out_rot, out_scale)
+                tgt_pb.matrix = target.matrix_world.inverted_safe() @ final_world
+                context.view_layer.update()
+
+                if key_loc:
+                    tgt_pb.keyframe_insert(data_path="location", frame=frame, group=tgt_pb.name)
+                if key_rot:
+                    tgt_pb.keyframe_insert(data_path=rotation_data_path(tgt_pb), frame=frame, group=tgt_pb.name)
+                if key_scale:
+                    tgt_pb.keyframe_insert(data_path="scale", frame=frame, group=tgt_pb.name)
+
+            if created_action is None and target.animation_data:
+                created_action = target.animation_data.action
+
+        created_action = target.animation_data.action if target.animation_data else created_action
+        if not created_action:
+            raise RuntimeError("Blender did not create a target Action")
+
+        base_name = action.name or "Action"
+        if preview:
+            created_action.name = f"PREVIEW_{base_name}_to_{target.name}"
+            created_action["motion_retarget_preview"] = True
+        else:
+            created_action.name = f"{base_name}_retarget_{target.name}"
+            created_action["motion_retarget_preview"] = False
+
+        created_action["motion_retarget_source_action"] = action.name
+        created_action["motion_retarget_source_rig"] = source.name
+        created_action["motion_retarget_target_rig"] = target.name
+        created_action["motion_retarget_version"] = KTMRT_ADDON_VERSION
+        created_action["motion_retarget_root_mode"] = settings.root_motion_mode
+
+        for fc in action_fcurves(created_action):
+            for kp in fc.keyframe_points:
+                kp.interpolation = 'LINEAR'
+
+        if old_preview_to_remove and old_preview_to_remove != created_action:
+            try:
+                if old_preview_to_remove.users == 0:
+                    bpy.data.actions.remove(old_preview_to_remove)
+            except Exception:
+                pass
+
+        return created_action, len(frames), root_scale
+
+    except Exception:
+        if target.animation_data:
+            target.animation_data.action = old_target_action
+        raise
+
+    finally:
+        set_action(source, old_source_action)
+        scene.frame_set(old_frame)
+        context.view_layer.update()
+
+
+class KTMRT_OT_Preview(Operator):
+    bl_idname = "kt_mrt.preview"
+    bl_label = "Build Preview"
+    bl_description = "Create a temporary baked Action on the target for visual inspection"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        settings = context.scene.kt_mrt_settings
+        try:
+            action, frame_count, scale = create_retarget_action(context, preview=True)
+        except Exception as exc:
+            self.report({'ERROR'}, f"Preview failed: {exc}")
+            return {'CANCELLED'}
+
+        settings.status_message = f"Preview ready: {action.name} · {frame_count} sampled frames"
+        self.report({'INFO'}, settings.status_message)
+        return {'FINISHED'}
+
+
+class KTMRT_OT_Bake(Operator):
+    bl_idname = "kt_mrt.bake"
+    bl_label = "Bake Retarget"
+    bl_description = "Bake a new retargeted Action on the target rig"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        settings = context.scene.kt_mrt_settings
+        try:
+            action, frame_count, scale = create_retarget_action(context, preview=False)
+        except Exception as exc:
+            self.report({'ERROR'}, f"Bake failed: {exc}")
+            return {'CANCELLED'}
+
+        settings.status_message = f"Baked: {action.name} · {frame_count} sampled frames"
+        self.report({'INFO'}, settings.status_message)
+        return {'FINISHED'}
+
+
+# -----------------------------------------------------------------------------
+# Preset operators
+# -----------------------------------------------------------------------------
+
+class KTMRT_OT_SavePreset(Operator):
+    bl_idname = "kt_mrt.save_preset"
+    bl_label = "Save Mapping Preset"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        settings = context.scene.kt_mrt_settings
+        if not settings.mappings:
+            self.report({'ERROR'}, "There is no mapping to save")
+            return {'CANCELLED'}
+
+        filename = safe_filename(settings.preset_name) + ".json"
+        try:
+            directory = preset_directory(create=True)
+            path = os.path.join(directory, filename)
+            payload = {
+                "format": "Motion Retarget Mapping",
+                "version": KTMRT_ADDON_VERSION,
+                "source_rig": settings.source_armature.name if settings.source_armature else "",
+                "target_rig": settings.target_armature.name if settings.target_armature else "",
+                "source_action": settings.source_action.name if settings.source_action else "",
+                "mappings": [
+                    {
+                        "source": item.source_bone,
+                        "target": item.target_bone,
+                        "copy_rotation": item.copy_rotation,
+                        "copy_location": item.copy_location,
+                        "copy_scale": item.copy_scale,
+                    }
+                    for item in settings.mappings
+                ],
+            }
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            self.report({'ERROR'}, f"Could not save preset next to the addon: {exc}")
+            return {'CANCELLED'}
+
+        refresh_preset_cache()
+        # Enum may reject assignment until items callback refreshes; ignore if so.
+        try:
+            settings.preset_file = filename
+        except Exception:
+            pass
+
+        settings.status_message = f"Preset saved: mappings/{filename}"
+        self.report({'INFO'}, settings.status_message)
+        return {'FINISHED'}
+
+
+class KTMRT_OT_LoadPreset(Operator):
+    bl_idname = "kt_mrt.load_preset"
+    bl_label = "Load Mapping Preset"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        settings = context.scene.kt_mrt_settings
+        filename = settings.preset_file
+        if not filename or filename == "__NONE__":
+            self.report({'ERROR'}, "No preset selected")
+            return {'CANCELLED'}
+        if not settings.mappings:
+            self.report({'ERROR'}, "Analyze an Action first, then load the preset")
+            return {'CANCELLED'}
+
+        path = os.path.join(preset_directory(create=False), filename)
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except Exception as exc:
+            self.report({'ERROR'}, f"Could not load preset: {exc}")
+            return {'CANCELLED'}
+
+        rows = {entry.get("source", ""): entry for entry in payload.get("mappings", [])}
+        target = settings.target_armature
+        valid_targets = {b.name for b in target.data.bones} if target else set()
+        applied = 0
+        missing_target = 0
+
+        changed_targets = 0
+        for item in settings.mappings:
+            entry = rows.get(item.source_bone)
+            if not entry:
+                continue
+            target_name = entry.get("target", "")
+            if target_name and target and target_name not in valid_targets:
+                target_name = ""
+                missing_target += 1
+
+            # Calibration belongs to a Source->Target pair. Reassigning the exact same
+            # Target used to fire the property update and erase a perfectly valid
+            # calibration. Only change the property when the mapping really changed.
+            if item.target_bone != target_name:
+                item.target_bone = target_name
+                changed_targets += 1
+            item.copy_rotation = bool(entry.get("copy_rotation", True))
+            item.copy_location = bool(entry.get("copy_location", False))
+            item.copy_scale = bool(entry.get("copy_scale", False))
+            item.manual_override = True
+            item.confidence = -1.0
+            applied += 1
+
+        current_refs, mapped_rows = current_calibration_counts(settings)
+        settings.calibration_count = current_refs
+        settings.has_calibration = current_refs > 0
+
+        stem = os.path.splitext(filename)[0]
+        settings.preset_name = stem
+        settings.status_message = f"Preset loaded: {applied} rows"
+        if changed_targets:
+            settings.status_message += f" · {changed_targets} mappings changed: recapture Calibration"
+        elif mapped_rows and current_refs == mapped_rows:
+            settings.status_message += " · Calibration preserved"
+        if missing_target:
+            settings.status_message += f" · {missing_target} missing target bones ignored"
+        self.report({'INFO'}, settings.status_message)
+        return {'FINISHED'}
+
+
+class KTMRT_OT_OpenPresetFolder(Operator):
+    bl_idname = "kt_mrt.open_preset_folder"
+    bl_label = "Open Preset Folder"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        try:
+            path = preset_directory(create=True)
+            bpy.ops.wm.path_open(filepath=path)
+        except Exception as exc:
+            self.report({'ERROR'}, f"Could not open preset folder: {exc}")
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+
+# -----------------------------------------------------------------------------
+# Bone Offset utility
+# -----------------------------------------------------------------------------
+
+class KTMRT_OT_UseSelectedOffsetRig(Operator):
+    bl_idname = "kt_mrt.use_selected_offset_rig"
+    bl_label = "Use Selected"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        obj = context.active_object
+        if not obj or obj.type != 'ARMATURE':
+            self.report({'ERROR'}, "Select an armature")
+            return {'CANCELLED'}
+        settings = context.scene.kt_mrt_settings
+        settings.offset_armature = obj
+        if obj.animation_data and obj.animation_data.action:
+            settings.offset_action = obj.animation_data.action
+        try:
+            if obj.data.bones.active:
+                settings.offset_bone = obj.data.bones.active.name
+        except Exception:
+            pass
+        return {'FINISHED'}
+
+
+class KTMRT_OT_UseActiveOffsetBone(Operator):
+    bl_idname = "kt_mrt.use_active_offset_bone"
+    bl_label = "Use Active Bone"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        settings = context.scene.kt_mrt_settings
+        rig = settings.offset_armature or context.active_object
+        if not rig or rig.type != 'ARMATURE':
+            self.report({'ERROR'}, "Choose an armature first")
+            return {'CANCELLED'}
+        bone = rig.data.bones.active
+        if not bone:
+            self.report({'ERROR'}, "Select a pose bone")
+            return {'CANCELLED'}
+        settings.offset_armature = rig
+        settings.offset_bone = bone.name
+        return {'FINISHED'}
+
+
+class KTMRT_OT_StartBoneOffset(Operator):
+    bl_idname = "kt_mrt.start_bone_offset"
+    bl_label = "Start Offset Edit"
+    bl_description = "Capture the selected bone pose at the current frame, then move/rotate it to define a constant offset"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        settings = context.scene.kt_mrt_settings
+        rig = settings.offset_armature
+        action = settings.offset_action
+        bone_name = settings.offset_bone
+
+        if not rig or rig.type != 'ARMATURE':
+            self.report({'ERROR'}, "Choose a Rig")
+            return {'CANCELLED'}
+        if not action:
+            action = rig.animation_data.action if rig.animation_data else None
+            settings.offset_action = action
+        if not action:
+            self.report({'ERROR'}, "Choose an Action")
+            return {'CANCELLED'}
+        pb = rig.pose.bones.get(bone_name)
+        if not pb:
+            self.report({'ERROR'}, "Choose a valid bone")
+            return {'CANCELLED'}
+
+        set_action(rig, action)
+        context.view_layer.update()
+        settings.offset_capture_local = matrix_to_json(pb.matrix_basis.copy())
+        settings.offset_capture_world = matrix_to_json(rig.matrix_world @ pb.matrix)
+        settings.offset_capture_frame = context.scene.frame_current
+        settings.offset_capture_action_name = action.name
+        settings.offset_editing = True
+        select_armature_pose_bone(context, rig, bone_name)
+        settings.offset_status = "Base captured. Move/rotate the bone, then Apply Offset to Action."
+        self.report({'INFO'}, settings.offset_status)
+        return {'FINISHED'}
+
+
+class KTMRT_OT_CancelBoneOffset(Operator):
+    bl_idname = "kt_mrt.cancel_bone_offset"
+    bl_label = "Cancel Offset Edit"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        settings = context.scene.kt_mrt_settings
+        rig = settings.offset_armature
+        pb = rig.pose.bones.get(settings.offset_bone) if rig else None
+        base = matrix_from_json(settings.offset_capture_local)
+        if pb and base is not None:
+            pb.matrix_basis = base
+            context.view_layer.update()
+        settings.offset_editing = False
+        settings.offset_capture_local = ""
+        settings.offset_capture_world = ""
+        settings.offset_capture_action_name = ""
+        settings.offset_status = "Offset edit cancelled"
+        return {'FINISHED'}
+
+
+def _component_scale_ratio(a, b):
+    return Vector((
+        b.x / a.x if abs(a.x) > 1e-8 else 1.0,
+        b.y / a.y if abs(a.y) > 1e-8 else 1.0,
+        b.z / a.z if abs(a.z) > 1e-8 else 1.0,
+    ))
+
+
+class KTMRT_OT_ApplyBoneOffset(Operator):
+    bl_idname = "kt_mrt.apply_bone_offset"
+    bl_label = "Apply Offset to Action"
+    bl_description = "Apply the captured pose difference to the chosen bone over the whole Action, creating a new Action"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        settings = context.scene.kt_mrt_settings
+        rig = settings.offset_armature
+        source_action = settings.offset_action
+        bone_name = settings.offset_bone
+
+        if not settings.offset_editing:
+            self.report({'ERROR'}, "Press Start Offset Edit first")
+            return {'CANCELLED'}
+        if not rig or rig.type != 'ARMATURE' or not source_action:
+            self.report({'ERROR'}, "Rig/Action missing")
+            return {'CANCELLED'}
+        pb = rig.pose.bones.get(bone_name)
+        if not pb:
+            self.report({'ERROR'}, "Bone no longer exists")
+            return {'CANCELLED'}
+
+        base_local = matrix_from_json(settings.offset_capture_local)
+        base_world = matrix_from_json(settings.offset_capture_world)
+        if base_local is None or base_world is None:
+            self.report({'ERROR'}, "Captured base pose is missing")
+            return {'CANCELLED'}
+
+        # Read the user's edited pose before frame changes evaluate the Action again.
+        edited_local = pb.matrix_basis.copy()
+        edited_world = rig.matrix_world @ pb.matrix
+
+        if settings.offset_space == 'GLOBAL':
+            b_loc, b_rot, b_scale = base_world.decompose()
+            e_loc, e_rot, e_scale = edited_world.decompose()
+            rot_delta = e_rot @ b_rot.inverted()
+            loc_delta = e_loc - b_loc
+            scale_ratio = _component_scale_ratio(b_scale, e_scale)
+        else:
+            b_loc, b_rot, b_scale = base_local.decompose()
+            e_loc, e_rot, e_scale = edited_local.decompose()
+            # Post/local rotation: preserve the offset relative to each frame's own bone orientation.
+            rot_delta = b_rot.inverted() @ e_rot
+            loc_delta = e_loc - b_loc
+            scale_ratio = _component_scale_ratio(b_scale, e_scale)
+
+        rot_changed = shortest_angle_deg(rot_delta) > 0.0001
+        loc_changed = loc_delta.length > 1e-7
+        scale_changed = any(abs(v - 1.0) > 1e-6 for v in scale_ratio)
+        if not (rot_changed or loc_changed or scale_changed):
+            self.report({'WARNING'}, "No offset detected; move/rotate/scale the bone after Start Offset Edit")
+            return {'CANCELLED'}
+
+        scene = context.scene
+        old_frame = scene.frame_current
+        old_action = rig.animation_data.action if rig.animation_data else None
+        start, end = action_range(source_action)
+        frames = frame_sequence(start, end, 1)
+
+        try:
+            # Restore the captured pose before evaluating the duplicated Action.
+            pb.matrix_basis = base_local
+            context.view_layer.update()
+
+            new_action = source_action.copy()
+            new_action.name = f"{source_action.name}_offset_{bone_name}"
+            new_action["motion_retarget_bone_offset"] = True
+            new_action["motion_retarget_offset_bone"] = bone_name
+            new_action["motion_retarget_offset_space"] = settings.offset_space
+            set_action(rig, new_action)
+
+            for frame in frames:
+                scene.frame_set(frame)
+                context.view_layer.update()
+                pb = rig.pose.bones.get(bone_name)
+
+                if settings.offset_space == 'GLOBAL':
+                    cur_world = rig.matrix_world @ pb.matrix
+                    c_loc, c_rot, c_scale = cur_world.decompose()
+                    n_loc = c_loc + loc_delta if loc_changed else c_loc
+                    n_rot = (rot_delta @ c_rot) if rot_changed else c_rot
+                    n_scale = Vector((
+                        c_scale.x * scale_ratio.x,
+                        c_scale.y * scale_ratio.y,
+                        c_scale.z * scale_ratio.z,
+                    )) if scale_changed else c_scale
+                    desired_world = Matrix.LocRotScale(n_loc, n_rot, n_scale)
+                    pb.matrix = rig.matrix_world.inverted_safe() @ desired_world
+                else:
+                    cur_local = pb.matrix_basis.copy()
+                    c_loc, c_rot, c_scale = cur_local.decompose()
+                    n_loc = c_loc + loc_delta if loc_changed else c_loc
+                    n_rot = (c_rot @ rot_delta) if rot_changed else c_rot
+                    n_scale = Vector((
+                        c_scale.x * scale_ratio.x,
+                        c_scale.y * scale_ratio.y,
+                        c_scale.z * scale_ratio.z,
+                    )) if scale_changed else c_scale
+                    pb.matrix_basis = Matrix.LocRotScale(n_loc, n_rot, n_scale)
+
+                context.view_layer.update()
+                if loc_changed:
+                    pb.keyframe_insert(data_path="location", frame=frame, group=pb.name)
+                if rot_changed:
+                    pb.keyframe_insert(data_path=rotation_data_path(pb), frame=frame, group=pb.name)
+                if scale_changed:
+                    pb.keyframe_insert(data_path="scale", frame=frame, group=pb.name)
+
+            for fc in action_fcurves(new_action):
+                if f'pose.bones["{bone_name}"]' not in fc.data_path:
+                    continue
+                for kp in fc.keyframe_points:
+                    kp.interpolation = 'LINEAR'
+
+            settings.offset_action = new_action
+            settings.offset_editing = False
+            settings.offset_capture_local = ""
+            settings.offset_capture_world = ""
+            settings.offset_capture_action_name = ""
+            settings.offset_status = f"Created {new_action.name} with offset on {bone_name} ({len(frames)} frames)"
+            scene.frame_set(old_frame)
+            context.view_layer.update()
+            self.report({'INFO'}, settings.offset_status)
+            return {'FINISHED'}
+
+        except Exception as exc:
+            set_action(rig, old_action)
+            scene.frame_set(old_frame)
+            context.view_layer.update()
+            self.report({'ERROR'}, f"Bone offset failed: {exc}")
+            return {'CANCELLED'}
+
+
+# -----------------------------------------------------------------------------
+# Copy Bone Animation utility
+# -----------------------------------------------------------------------------
+
+def action_fcurve_entries(action):
+    """Return unique (owner_collection, fcurve) entries for layered and legacy Actions."""
+    if not action:
+        return []
+
+    entries = []
+    seen = set()
+
+    # Layered Actions (Blender 4.4+ / 5.x).
+    try:
+        for layer in action.layers:
+            for strip in layer.strips:
+                channelbags = getattr(strip, "channelbags", None)
+                if channelbags is None:
+                    continue
+                for channelbag in channelbags:
+                    collection = channelbag.fcurves
+                    for fc in list(collection):
+                        ptr = fc.as_pointer()
+                        if ptr in seen:
+                            continue
+                        seen.add(ptr)
+                        entries.append((collection, fc))
+    except Exception:
+        pass
+
+    # Legacy / compatibility API.
+    try:
+        collection = action.fcurves
+        for fc in list(collection):
+            ptr = fc.as_pointer()
+            if ptr in seen:
+                continue
+            seen.add(ptr)
+            entries.append((collection, fc))
+    except Exception:
+        pass
+
+    return entries
+
+
+def action_is_layered(action):
+    if not action:
+        return False
+    try:
+        return bool(action.is_action_layered)
+    except Exception:
+        try:
+            return len(action.slots) > 0
+        except Exception:
+            return False
+
+
+def action_slot_for_object(action, obj):
+    """Find the Action slot that belongs to obj, without changing obj's current Action."""
+    if not action or not obj:
+        return None
+
+    anim_data = getattr(obj, "animation_data", None)
+    if anim_data and anim_data.action == action:
+        try:
+            slot = anim_data.action_slot
+            if slot is not None:
+                return slot
+        except Exception:
+            pass
+
+    try:
+        slots = list(action.slots)
+    except Exception:
+        return None
+
+    for slot in slots:
+        try:
+            if obj in slot.users():
+                return slot
+        except Exception:
+            pass
+
+    compatible = [
+        slot for slot in slots
+        if getattr(slot, "target_id_type", None) in {None, obj.id_type}
+    ]
+    if len(compatible) == 1:
+        return compatible[0]
+
+    return None
+
+
+def action_slot_by_identifier(action, identifier):
+    if not action or not identifier:
+        return None
+    try:
+        for slot in action.slots:
+            if slot.identifier == identifier:
+                return slot
+    except Exception:
+        pass
+    return None
+
+
+def action_fcurve_entries_for_slot(action, slot):
+    """Return F-Curves only from one layered Action slot; legacy Actions use all curves."""
+    if not action:
+        return []
+
+    if slot is not None:
+        entries = []
+        seen = set()
+        try:
+            for layer in action.layers:
+                for strip in layer.strips:
+                    for channelbag in getattr(strip, "channelbags", ()):
+                        if getattr(channelbag, "slot", None) != slot:
+                            continue
+                        collection = channelbag.fcurves
+                        for fc in list(collection):
+                            ptr = fc.as_pointer()
+                            if ptr in seen:
+                                continue
+                            seen.add(ptr)
+                            entries.append((collection, fc))
+        except Exception:
+            pass
+        return entries
+
+    if action_is_layered(action):
+        return []
+
+    return action_fcurve_entries(action)
+
+
+def assign_action_to_object(obj, action, preferred_slot_identifier=""):
+    """Assign action to obj and select/create the correct layered Action slot."""
+    anim_data = obj.animation_data_create()
+
+    if action is None:
+        anim_data.action = None
+        return None
+
+    # Legacy Actions do not expose usable slots.
+    try:
+        if action.is_action_legacy:
+            anim_data.action = action
+            return None
+    except Exception:
+        pass
+
+    slot = action_slot_by_identifier(action, preferred_slot_identifier)
+
+    if slot is None:
+        try:
+            compatible = [
+                candidate for candidate in action.slots
+                if getattr(candidate, "target_id_type", None) in {None, obj.id_type}
+            ]
+            if len(compatible) == 1:
+                slot = compatible[0]
+        except Exception:
+            pass
+
+    if slot is None:
+        try:
+            slot = action.slots.new(id_type=obj.id_type, name=obj.name)
+        except Exception:
+            slot = None
+
+    anim_data.action = action
+
+    if slot is None:
+        try:
+            suitable = list(anim_data.action_suitable_slots)
+            if suitable:
+                slot = suitable[0]
+        except Exception:
+            pass
+
+    if slot is not None:
+        try:
+            anim_data.action_slot = slot
+        except Exception:
+            pass
+
+    return slot
+
+
+def ensure_action_fcurve_collection(action, obj, preferred_slot_identifier=""):
+    """Return the destination F-Curve collection for obj inside action."""
+    slot = assign_action_to_object(obj, action, preferred_slot_identifier)
+
+    if slot is not None:
+        if action_ensure_channelbag_for_slot is not None:
+            try:
+                channelbag = action_ensure_channelbag_for_slot(action, slot)
+                return channelbag.fcurves, slot
+            except Exception:
+                pass
+
+        # Local fallback for Blender versions without bpy_extras helper.
+        try:
+            layer = action.layers[0] if len(action.layers) else action.layers.new(name="Layer")
+            strip = None
+            for candidate in layer.strips:
+                if getattr(candidate, "type", "") == 'KEYFRAME':
+                    strip = candidate
+                    break
+            if strip is None:
+                strip = layer.strips.new(type='KEYFRAME')
+            channelbag = strip.channelbag(slot, ensure=True)
+            return channelbag.fcurves, slot
+        except Exception as exc:
+            raise RuntimeError(f"Could not create Target Action slot/channelbag: {exc}")
+
+    try:
+        return action.fcurves, None
+    except Exception:
+        raise RuntimeError("Target Action has no writable F-Curve collection")
+
+
+def _copy_rna_writable_properties(source, target, ignored=None):
+    ignored = set(ignored or ())
+    ignored.update({"rna_type", "type"})
+
+    try:
+        properties = source.bl_rna.properties
+    except Exception:
+        return
+
+    for prop in properties:
+        identifier = prop.identifier
+        if identifier in ignored or getattr(prop, "is_readonly", False):
+            continue
+        try:
+            setattr(target, identifier, getattr(source, identifier))
+        except Exception:
+            pass
+
+
+def clone_fcurve(owner_collection, source_fc, data_path, group_name):
+    """Clone one F-Curve into a target Action slot/channelbag under a new data path."""
+    try:
+        new_fc = owner_collection.new(
+            data_path,
+            index=source_fc.array_index,
+            group_name=group_name,
+        )
+    except TypeError:
+        # Legacy Action collection.
+        new_fc = owner_collection.new(
+            data_path,
+            index=source_fc.array_index,
+            action_group=group_name,
+        )
+
+    for attr in (
+        "extrapolation", "color_mode", "auto_smoothing",
+        "mute", "lock", "hide", "select",
+    ):
+        try:
+            setattr(new_fc, attr, getattr(source_fc, attr))
+        except Exception:
+            pass
+
+    try:
+        new_fc.color = source_fc.color
+    except Exception:
+        pass
+
+    src_points = list(source_fc.keyframe_points)
+    if src_points:
+        new_fc.keyframe_points.add(len(src_points))
+
+    for src, dst in zip(src_points, new_fc.keyframe_points):
+        for attr in (
+            "co", "handle_left", "handle_right",
+            "interpolation", "easing",
+            "handle_left_type", "handle_right_type",
+            "amplitude", "back", "period", "type",
+        ):
+            try:
+                setattr(dst, attr, getattr(src, attr))
+            except Exception:
+                pass
+
+    # Copy modifiers when possible (Cycles, Noise, Generator, etc.).
+    try:
+        for src_modifier in source_fc.modifiers:
+            dst_modifier = new_fc.modifiers.new(src_modifier.type)
+            _copy_rna_writable_properties(src_modifier, dst_modifier)
+    except Exception:
+        pass
+
+    try:
+        new_fc.update()
+    except Exception:
+        pass
+
+    return new_fc
+
+
+def remove_fcurves_from_collection(owner_collection, data_paths):
+    """Remove matching curves only from the destination Action slot/collection."""
+    targets = set(data_paths)
+    removed = 0
+    for fc in list(owner_collection):
+        if fc.data_path not in targets:
+            continue
+        try:
+            owner_collection.remove(fc)
+            removed += 1
+        except Exception:
+            pass
+    return removed
+
+
+def pose_bone_curve_property(data_path, bone_prefix):
+    prefix = bone_prefix + "."
+    if not data_path.startswith(prefix):
+        return ""
+    return data_path[len(prefix):]
+
+
+def selected_pose_bone_names(context, rig):
+    if not rig or context.active_object != rig or context.mode != 'POSE':
+        return []
+    try:
+        return [pb.name for pb in (context.selected_pose_bones or [])]
+    except Exception:
+        return []
+
+
+def copy_item_properties(item):
+    properties = set()
+    if item.copy_location:
+        properties.add("location")
+    if item.copy_rotation:
+        properties.update({
+            "rotation_euler",
+            "rotation_quaternion",
+            "rotation_axis_angle",
+        })
+    if item.copy_scale:
+        properties.add("scale")
+    return properties
+
+
+def copy_item_channel_codes(item):
+    channels = []
+    if item.copy_rotation:
+        channels.append('R')
+    if item.copy_location:
+        channels.append('L')
+    if item.copy_scale:
+        channels.append('S')
+    return channels
+
+
+def active_copy_mapping(settings, create=False):
+    if settings.copy_destinations:
+        index = max(0, min(settings.copy_destination_index, len(settings.copy_destinations) - 1))
+        settings.copy_destination_index = index
+        return settings.copy_destinations[index]
+    if not create:
+        return None
+    item = settings.copy_destinations.add()
+    settings.copy_destination_index = 0
+    return item
+
+
+def active_bone_name_for_rig(context, rig):
+    if not rig or context.active_object != rig:
+        return ""
+    try:
+        bone = rig.data.bones.active
+        return bone.name if bone else ""
+    except Exception:
+        return ""
+
+
+class KTMRT_UL_CopyMappings(UIList):
+    """Editable Source Bone -> Write To Bone rows."""
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        settings = context.scene.kt_mrt_settings
+        source_rig = settings.copy_source_armature
+        target_rig = settings.copy_target_armature
+
+        if self.layout_type in {'DEFAULT', 'COMPACT'}:
+            row = layout.row(align=True)
+
+            source_col = row.row(align=True)
+            source_col.scale_x = 1.0
+            if source_rig and source_rig.type == 'ARMATURE':
+                source_col.prop_search(item, "source_bone", source_rig.data, "bones", text="")
+            else:
+                source_col.prop(item, "source_bone", text="")
+
+            row.label(text="", icon='FORWARD')
+
+            target_col = row.row(align=True)
+            target_col.scale_x = 1.0
+            if target_rig and target_rig.type == 'ARMATURE':
+                target_col.prop_search(item, "target_bone", target_rig.data, "bones", text="")
+            else:
+                target_col.prop(item, "target_bone", text="")
+
+            row.prop(item, "copy_rotation", text="R", toggle=True)
+            row.prop(item, "copy_location", text="L", toggle=True)
+            row.prop(item, "copy_scale", text="S", toggle=True)
+        else:
+            layout.label(text=item.source_bone or item.target_bone or "Bone Copy", icon='DUPLICATE')
+
+
+class KTMRT_OT_UseSelectedCopyRig(Operator):
+    bl_idname = "kt_mrt.use_selected_copy_rig"
+    bl_label = "Use Selected"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    role: EnumProperty(
+        items=[
+            ('SOURCE', "Source", "Use selected armature as Source Rig"),
+            ('TARGET', "Target", "Use selected armature as Target Rig"),
+        ],
+        default='SOURCE',
+    )
+
+    def execute(self, context):
+        obj = context.active_object
+        if not obj or obj.type != 'ARMATURE':
+            self.report({'ERROR'}, "Select an armature")
+            return {'CANCELLED'}
+
+        settings = context.scene.kt_mrt_settings
+        active_action = obj.animation_data.action if obj.animation_data else None
+        active_bone = active_bone_name_for_rig(context, obj)
+
+        if self.role == 'TARGET':
+            settings.copy_target_armature = obj
+            if active_action:
+                settings.copy_target_action = active_action
+            if active_bone:
+                item = active_copy_mapping(settings, create=True)
+                item.target_bone = active_bone
+        else:
+            settings.copy_source_armature = obj
+            if active_action:
+                settings.copy_source_action = active_action
+            if active_bone:
+                item = active_copy_mapping(settings, create=True)
+                item.source_bone = active_bone
+
+        return {'FINISHED'}
+
+
+class KTMRT_OT_UseCurrentCopyAction(Operator):
+    bl_idname = "kt_mrt.use_current_copy_action"
+    bl_label = "Use Current Action"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    role: EnumProperty(
+        items=[
+            ('SOURCE', "Source", "Use the Source Rig's active Action"),
+            ('TARGET', "Target", "Use the Target Rig's active Action"),
+        ],
+        default='SOURCE',
+    )
+
+    def execute(self, context):
+        settings = context.scene.kt_mrt_settings
+        rig = settings.copy_target_armature if self.role == 'TARGET' else settings.copy_source_armature
+
+        if not rig or rig.type != 'ARMATURE':
+            self.report({'ERROR'}, f"Choose a {self.role.title()} Rig first")
+            return {'CANCELLED'}
+
+        action = rig.animation_data.action if rig.animation_data else None
+        if not action:
+            self.report({'ERROR'}, f"{self.role.title()} Rig has no active Action")
+            return {'CANCELLED'}
+
+        if self.role == 'TARGET':
+            settings.copy_target_action = action
+        else:
+            settings.copy_source_action = action
+
+        return {'FINISHED'}
+
+
+class KTMRT_OT_UseActiveCopySource(Operator):
+    bl_idname = "kt_mrt.use_active_copy_source"
+    bl_label = "Use Active Bone as Source"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        settings = context.scene.kt_mrt_settings
+        rig = settings.copy_source_armature or context.active_object
+        if not rig or rig.type != 'ARMATURE':
+            self.report({'ERROR'}, "Choose a Source Rig first")
+            return {'CANCELLED'}
+
+        name = active_bone_name_for_rig(context, rig)
+        if not name:
+            self.report({'ERROR'}, "Make the Source Rig active and select a pose bone")
+            return {'CANCELLED'}
+
+        settings.copy_source_armature = rig
+        item = active_copy_mapping(settings, create=True)
+        item.source_bone = name
+        return {'FINISHED'}
+
+
+class KTMRT_OT_UseActiveCopyTarget(Operator):
+    bl_idname = "kt_mrt.use_active_copy_target"
+    bl_label = "Use Active Bone as Destination"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        settings = context.scene.kt_mrt_settings
+        rig = settings.copy_target_armature or context.active_object
+        if not rig or rig.type != 'ARMATURE':
+            self.report({'ERROR'}, "Choose a Target Rig first")
+            return {'CANCELLED'}
+
+        name = active_bone_name_for_rig(context, rig)
+        if not name:
+            self.report({'ERROR'}, "Make the Target Rig active and select a pose bone")
+            return {'CANCELLED'}
+
+        settings.copy_target_armature = rig
+        item = active_copy_mapping(settings, create=True)
+        item.target_bone = name
+        return {'FINISHED'}
+
+
+class KTMRT_OT_AddCopyDestination(Operator):
+    bl_idname = "kt_mrt.add_copy_destination"
+    bl_label = "Add Bone Copy Row"
+    bl_description = "Add a Source Bone -> Write To Bone row"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        settings = context.scene.kt_mrt_settings
+        previous = active_copy_mapping(settings, create=False)
+        item = settings.copy_destinations.add()
+
+        if previous:
+            item.source_bone = previous.source_bone
+            item.copy_rotation = previous.copy_rotation
+            item.copy_location = previous.copy_location
+            item.copy_scale = previous.copy_scale
+        else:
+            item.source_bone = active_bone_name_for_rig(context, settings.copy_source_armature)
+            item.target_bone = active_bone_name_for_rig(context, settings.copy_target_armature)
+
+        settings.copy_destination_index = len(settings.copy_destinations) - 1
+        return {'FINISHED'}
+
+
+class KTMRT_OT_DuplicateCopyDestination(Operator):
+    bl_idname = "kt_mrt.duplicate_copy_destination"
+    bl_label = "Duplicate Source Row"
+    bl_description = "Duplicate the active row and leave its destination empty"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        settings = context.scene.kt_mrt_settings
+        source = active_copy_mapping(settings, create=False)
+        if source is None:
+            self.report({'ERROR'}, "Add or select a Bone Copy row first")
+            return {'CANCELLED'}
+
+        item = settings.copy_destinations.add()
+        item.source_bone = source.source_bone
+        item.target_bone = ""
+        item.copy_rotation = source.copy_rotation
+        item.copy_location = source.copy_location
+        item.copy_scale = source.copy_scale
+        settings.copy_destination_index = len(settings.copy_destinations) - 1
+        return {'FINISHED'}
+
+
+class KTMRT_OT_RemoveCopyDestination(Operator):
+    bl_idname = "kt_mrt.remove_copy_destination"
+    bl_label = "Remove Bone Copy Row"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        settings = context.scene.kt_mrt_settings
+        index = settings.copy_destination_index
+        if 0 <= index < len(settings.copy_destinations):
+            settings.copy_destinations.remove(index)
+            settings.copy_destination_index = min(index, max(0, len(settings.copy_destinations) - 1))
+        return {'FINISHED'}
+
+
+class KTMRT_OT_ClearCopyDestinations(Operator):
+    bl_idname = "kt_mrt.clear_copy_destinations"
+    bl_label = "Clear Bone Copy Rows"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        settings = context.scene.kt_mrt_settings
+        settings.copy_destinations.clear()
+        settings.copy_destination_index = 0
+        settings.copy_status = "Bone Copy rows cleared"
+        return {'FINISHED'}
+
+
+class KTMRT_OT_AddSelectedCopyDestinations(Operator):
+    bl_idname = "kt_mrt.add_selected_copy_destinations"
+    bl_label = "Add Selected Target Bones"
+    bl_description = "Create one row per selected Target Pose Bone, using the active row's Source Bone"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        settings = context.scene.kt_mrt_settings
+        target_rig = settings.copy_target_armature
+        if not target_rig or target_rig.type != 'ARMATURE':
+            self.report({'ERROR'}, "Choose a Target Rig")
+            return {'CANCELLED'}
+
+        template = active_copy_mapping(settings, create=False)
+        if template is None or not template.source_bone:
+            self.report({'ERROR'}, "Choose a Source Bone in the active Bone Copy row first")
+            return {'CANCELLED'}
+
+        names = selected_pose_bone_names(context, target_rig)
+        if not names:
+            self.report({'ERROR'}, "Select destination bones on the Target Rig in Pose Mode")
+            return {'CANCELLED'}
+
+        existing = {
+            (item.source_bone, item.target_bone)
+            for item in settings.copy_destinations
+            if item.source_bone and item.target_bone
+        }
+        added = 0
+
+        for name in names:
+            pair = (template.source_bone, name)
+            if pair in existing:
+                continue
+            item = settings.copy_destinations.add()
+            item.source_bone = template.source_bone
+            item.target_bone = name
+            item.copy_rotation = template.copy_rotation
+            item.copy_location = template.copy_location
+            item.copy_scale = template.copy_scale
+            existing.add(pair)
+            added += 1
+
+        if added:
+            settings.copy_destination_index = len(settings.copy_destinations) - 1
+        settings.copy_status = f"Added {added} destination bone{'s' if added != 1 else ''}"
+        self.report({'INFO'}, settings.copy_status)
+        return {'FINISHED'}
+
+
+class KTMRT_OT_CopyBoneAnimation(Operator):
+    bl_idname = "kt_mrt.copy_bone_animation"
+    bl_label = "Copy Bone Animation"
+    bl_description = "Copy multiple Source Bone -> Write To Bone rows into a Target Action"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        settings = context.scene.kt_mrt_settings
+        source_rig = settings.copy_source_armature
+        source_action = settings.copy_source_action
+        target_rig = settings.copy_target_armature
+        target_action = settings.copy_target_action
+
+        if not source_rig or source_rig.type != 'ARMATURE':
+            self.report({'ERROR'}, "Choose a Source Rig")
+            return {'CANCELLED'}
+        if not target_rig or target_rig.type != 'ARMATURE':
+            self.report({'ERROR'}, "Choose a Target Rig")
+            return {'CANCELLED'}
+
+        if not source_action:
+            source_action = source_rig.animation_data.action if source_rig.animation_data else None
+            settings.copy_source_action = source_action
+        if not source_action:
+            self.report({'ERROR'}, "Choose a Source Action")
+            return {'CANCELLED'}
+
+        if not target_action:
+            target_action = target_rig.animation_data.action if target_rig.animation_data else None
+            if target_action:
+                settings.copy_target_action = target_action
+
+        if settings.copy_output_mode == 'CURRENT' and not target_action:
+            self.report({'ERROR'}, "Choose a Target Action, or use New Action Copy")
+            return {'CANCELLED'}
+
+        valid_rows = []
+        channel_owners = {}
+        errors = []
+        seen_exact = set()
+
+        for row_index, item in enumerate(settings.copy_destinations, start=1):
+            source_name = item.source_bone.strip()
+            target_name = item.target_bone.strip()
+
+            if not source_name and not target_name:
+                continue
+            if not source_name or not target_name:
+                errors.append(f"Row {row_index}: choose both Source and Write To bones")
+                continue
+            source_pb = source_rig.pose.bones.get(source_name)
+            target_pb = target_rig.pose.bones.get(target_name)
+            if source_pb is None:
+                errors.append(f"Row {row_index}: Source bone '{source_name}' was not found")
+                continue
+            if target_pb is None:
+                errors.append(f"Row {row_index}: Target bone '{target_name}' was not found")
+                continue
+
+            properties = copy_item_properties(item)
+            channel_codes = copy_item_channel_codes(item)
+            if not properties:
+                errors.append(f"Row {row_index}: enable R, L and/or S")
+                continue
+
+            exact_key = (source_name, target_name, tuple(sorted(channel_codes)))
+            if exact_key in seen_exact:
+                continue
+            seen_exact.add(exact_key)
+
+            for code in channel_codes:
+                key = (target_name, code)
+                previous = channel_owners.get(key)
+                if previous is not None:
+                    errors.append(
+                        f"Row {row_index}: {target_name} {code} already receives animation from {previous}"
+                    )
+                else:
+                    channel_owners[key] = source_name
+
+            valid_rows.append({
+                "source_name": source_name,
+                "target_name": target_name,
+                "source_pb": source_pb,
+                "target_pb": target_pb,
+                "properties": properties,
+                "channels": channel_codes,
+                "copy_rotation": item.copy_rotation,
+                "copy_location": item.copy_location,
+                "copy_scale": item.copy_scale,
+            })
+
+        if errors:
+            self.report({'ERROR'}, errors[0])
+            settings.copy_status = " | ".join(errors[:3])
+            return {'CANCELLED'}
+        if not valid_rows:
+            self.report({'ERROR'}, "Add at least one valid Bone Copy row")
+            return {'CANCELLED'}
+
+        source_slot = action_slot_for_object(source_action, source_rig)
+        if action_is_layered(source_action) and source_slot is None:
+            self.report({'ERROR'}, "Source Action slot is ambiguous. Assign it to the Source Rig or press Use Current")
+            return {'CANCELLED'}
+
+        source_slot_identifier = getattr(source_slot, "identifier", "") if source_slot else ""
+        target_slot = action_slot_for_object(target_action, target_rig) if target_action else None
+        target_slot_identifier = getattr(target_slot, "identifier", "") if target_slot else ""
+
+        old_target_action = target_rig.animation_data.action if target_rig.animation_data else None
+        old_target_slot = action_slot_for_object(old_target_action, target_rig) if old_target_action else None
+        old_target_slot_identifier = getattr(old_target_slot, "identifier", "") if old_target_slot else ""
+
+        output_action = None
+        source_snapshot = None
+        created_new_action = settings.copy_output_mode == 'NEW'
+
+        try:
+            source_read_action = source_action
+            source_read_slot = source_slot
+            if settings.copy_output_mode == 'CURRENT' and target_action == source_action:
+                source_snapshot = source_action.copy()
+                source_read_action = source_snapshot
+                source_read_slot = action_slot_by_identifier(source_snapshot, source_slot_identifier)
+
+            source_entries = action_fcurve_entries_for_slot(source_read_action, source_read_slot)
+            curves_by_row = []
+
+            for row in valid_rows:
+                source_prefix = row["source_pb"].path_from_id()
+                row_curves = []
+                for _owner_collection, fc in source_entries:
+                    prop_name = pose_bone_curve_property(fc.data_path, source_prefix)
+                    if prop_name in row["properties"]:
+                        row_curves.append(fc)
+                if not row_curves:
+                    raise RuntimeError(
+                        f"Source bone {row['source_name']} has no curves in channels {','.join(row['channels'])}"
+                    )
+                curves_by_row.append((row, source_prefix, row_curves))
+
+            if settings.copy_output_mode == 'CURRENT':
+                output_action = target_action
+            elif target_action:
+                output_action = target_action.copy()
+                output_action.name = f"{target_action.name}_bone_copies"
+                output_action.use_fake_user = True
+            else:
+                output_action = bpy.data.actions.new(
+                    f"COPY_BONES_to_{safe_filename(target_rig.name)}"
+                )
+                output_action.use_fake_user = True
+
+            target_collection, _output_slot = ensure_action_fcurve_collection(
+                output_action,
+                target_rig,
+                preferred_slot_identifier=target_slot_identifier,
+            )
+
+            destination_paths = set()
+            for row in valid_rows:
+                prefix = row["target_pb"].path_from_id()
+                if row["copy_location"]:
+                    destination_paths.add(prefix + ".location")
+                if row["copy_rotation"]:
+                    destination_paths.update({
+                        prefix + ".rotation_euler",
+                        prefix + ".rotation_quaternion",
+                        prefix + ".rotation_axis_angle",
+                    })
+                if row["copy_scale"]:
+                    destination_paths.add(prefix + ".scale")
+
+            remove_fcurves_from_collection(target_collection, destination_paths)
+
+            copied_curves = 0
+            metadata_rows = []
+            for row, source_prefix, source_curves in curves_by_row:
+                destination_pb = row["target_pb"]
+                destination_prefix = destination_pb.path_from_id()
+
+                if row["copy_rotation"]:
+                    destination_pb.rotation_mode = row["source_pb"].rotation_mode
+
+                for source_fc in source_curves:
+                    suffix = source_fc.data_path[len(source_prefix):]
+                    clone_fcurve(
+                        target_collection,
+                        source_fc,
+                        destination_prefix + suffix,
+                        row["target_name"],
+                    )
+                    copied_curves += 1
+
+                metadata_rows.append({
+                    "source": row["source_name"],
+                    "target": row["target_name"],
+                    "channels": row["channels"],
+                })
+
+            output_action["motion_retarget_copy_source_rig"] = source_rig.name
+            output_action["motion_retarget_copy_source_action"] = source_action.name
+            output_action["motion_retarget_copy_target_rig"] = target_rig.name
+            output_action["motion_retarget_copy_mappings"] = json.dumps(metadata_rows)
+            output_action["motion_retarget_version"] = KTMRT_ADDON_VERSION
+
+            settings.copy_target_action = output_action
+            context.view_layer.update()
+
+            verb = "Updated" if settings.copy_output_mode == 'CURRENT' else "Created"
+            settings.copy_status = (
+                f"{verb} {output_action.name}: {copied_curves} curves copied through "
+                f"{len(valid_rows)} bone mapping{'s' if len(valid_rows) != 1 else ''}"
+            )
+            self.report({'INFO'}, settings.copy_status)
+            return {'FINISHED'}
+
+        except Exception as exc:
+            try:
+                assign_action_to_object(target_rig, old_target_action, old_target_slot_identifier)
+            except Exception:
+                pass
+            if created_new_action and output_action is not None:
+                try:
+                    bpy.data.actions.remove(output_action, do_unlink=True)
+                except Exception:
+                    pass
+            self.report({'ERROR'}, f"Copy animation failed: {exc}")
+            return {'CANCELLED'}
+
+        finally:
+            if source_snapshot is not None:
+                try:
+                    bpy.data.actions.remove(source_snapshot, do_unlink=True)
+                except Exception:
+                    pass
+
+
+# -----------------------------------------------------------------------------
+# Panel
+# -----------------------------------------------------------------------------
+
+
+
+def kt_retarget_panels_visible(context):
+    scene = getattr(context, "scene", None)
+    return bool(scene and getattr(scene, "kt_retarget_enabled", False))
+
+
+class KTMRT_PT_Main(Panel):
+    bl_label = "Motion Retarget"
+    bl_order = 0
+    bl_idname = "KTMRT_PT_main"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'Retarget'
+
+    @classmethod
+    def poll(cls, context):
+        return kt_retarget_panels_visible(context)
+
+    def draw_header(self, context):
+        self.layout.label(text="", icon='ACTION')
+
+    def draw(self, context):
+        layout = self.layout
+        settings = context.scene.kt_mrt_settings
+
+        # 1) Setup & Analysis
+        setup_area = layout.column()
+        setup_area.enabled = not settings.calibration_mode
+        setup = setup_area.box()
+        header = setup.row(align=True)
+        header.prop(
+            settings, "show_setup", text="Setup & Analysis",
+            icon='TRIA_DOWN' if settings.show_setup else 'TRIA_RIGHT',
+            emboss=True, toggle=True,
+        )
+
+        if settings.show_setup:
+            setup.label(text="Source")
+            row = setup.row(align=True)
+            row.prop(settings, "source_armature", text="")
+            row.operator("kt_mrt.use_selected_source", text="Use Selected")
+            setup.prop(settings, "source_action", text="Action")
+
+            setup.separator(factor=0.5)
+            setup.label(text="Target")
+            row = setup.row(align=True)
+            row.prop(settings, "target_armature", text="")
+            row.operator("kt_mrt.use_selected_target", text="Use Selected")
+
+            setup.separator(factor=0.5)
+            row = setup.row(align=True)
+            row.prop(settings, "analysis_step")
+            row.prop(settings, "significance_ratio")
+            setup.operator("kt_mrt.analyze", text="Analyze Animation", icon='ACTION')
+            if settings.analyzed:
+                setup.label(text=f"Range: {settings.analysis_start} - {settings.analysis_end}")
+
+        # Mapping/presets come BEFORE Calibration because calibration depends on the final map.
+        pre_cal = layout.column()
+        pre_cal.enabled = not settings.calibration_mode
+
+        if settings.mappings:
+            box = pre_cal.box()
+            header = box.row(align=True)
+            header.prop(
+                settings, "show_mapping", text="Bone Mapping",
+                icon='TRIA_DOWN' if settings.show_mapping else 'TRIA_RIGHT',
+                emboss=True, toggle=True,
+            )
+
+            if settings.show_mapping:
+                controls = box.split(factor=0.48, align=True)
+                sort_row = controls.row(align=True)
+                sort_row.label(text="Sort:")
+                sort_row.prop(settings, "sort_mode", text="")
+                show_row = controls.row(align=True)
+                show_row.label(text="Show:")
+                show_row.prop(settings, "filter_mode", text="")
+
+                table_header = box.row(align=True)
+                col = table_header.row(align=True)
+                col.scale_x = 1.15
+                col.label(text="Source")
+                col = table_header.row(align=True)
+                col.scale_x = 1.0
+                col.label(text="Target")
+                table_header.label(text="")
+                table_header.label(text="Rot")
+                table_header.label(text="Loc")
+                table_header.label(text="Scale")
+                table_header.label(text="Match")
+
+                box.template_list(
+                    "KTMRT_UL_Mappings", "", settings, "mappings",
+                    settings, "active_mapping_index", rows=10,
+                )
+
+                row = box.row(align=True)
+                op = row.operator("kt_mrt.auto_map", text="Auto Map")
+                op.only_unmapped = False
+                op = row.operator("kt_mrt.auto_map", text="Fill Missing")
+                op.only_unmapped = True
+                row.operator("kt_mrt.clear_all_mappings", text="Clear")
+
+                row = box.row(align=True)
+                row.prop(settings, "automap_threshold")
+                row.prop(settings, "scale_root_translation")
+
+                root_row = box.row(align=True)
+                root_row.prop(settings, "root_motion_mode", text="Root Motion")
+                if settings.root_motion_mode == 'CUSTOM':
+                    target = settings.target_armature
+                    if target and target.type == 'ARMATURE':
+                        root_row.prop_search(settings, "root_motion_target", target.data, "bones", text="")
+                    else:
+                        root_row.prop(settings, "root_motion_target", text="")
+
+                if settings.has_calibration:
+                    box.label(text="Rotation: captured Reference Pose where available", icon='CHECKMARK')
+                box.prop(settings, "rotation_mode", text="Fallback Rotation Space")
+
+                debug_row = box.row(align=True)
+                debug_row.operator("kt_mrt.debug_selected_mapping", text="Debug Selected")
+                debug_row.prop(
+                    settings, "show_debug", text="Debug",
+                    icon='TRIA_DOWN' if settings.show_debug else 'TRIA_RIGHT',
+                    emboss=False,
+                )
+                if settings.show_debug and settings.debug_report:
+                    debug_box = box.box()
+                    for line in settings.debug_report.splitlines():
+                        debug_box.label(text=line)
+
+            presets = pre_cal.box()
+            header = presets.row(align=True)
+            header.prop(
+                settings, "show_presets", text="Mapping Presets",
+                icon='TRIA_DOWN' if settings.show_presets else 'TRIA_RIGHT',
+                emboss=True, toggle=True,
+            )
+
+            if settings.show_presets:
+                row = presets.row(align=True)
+                row.prop(settings, "preset_file", text="")
+                row.operator("kt_mrt.load_preset", text="Load")
+                row.operator("kt_mrt.open_preset_folder", text="", icon='FILE_FOLDER')
+                row = presets.row(align=True)
+                row.prop(settings, "preset_name", text="Name")
+                row.operator("kt_mrt.save_preset", text="Save JSON")
+
+        # 3) Calibration after the final mapping/preset.
+        calibration = layout.box()
+        row = calibration.row(align=True)
+        row.scale_y = 1.35
+        row.operator(
+            "kt_mrt.toggle_calibration_mode",
+            text="Calibration MODE" if not settings.calibration_mode else "Calibration MODE  ON",
+            icon='POSE_HLT',
+            depress=settings.calibration_mode,
+        )
+
+        current_refs, mapped_rows = current_calibration_counts(settings)
+        if not settings.calibration_mode:
+            status = calibration.row(align=True)
+            if mapped_rows and current_refs == mapped_rows:
+                status.label(text=f"CALIBRATION DONE  ({current_refs}/{mapped_rows})", icon='CHECKMARK')
+            elif current_refs:
+                status.alert = True
+                status.label(text=f"CALIBRATION PARTIAL  ({current_refs}/{mapped_rows}) - recapture", icon='ERROR')
+            else:
+                status.label(text="Calibration not captured", icon='INFO')
+            if current_refs:
+                status.operator("kt_mrt.clear_reference_pose", text="Clear", icon='X')
+
+        if settings.calibration_mode:
+            warning = calibration.box()
+            warning.alert = True
+            warning.label(text="CALIBRATION MODE ACTIVE", icon='INFO')
+            warning.label(text="Animation is temporarily disabled on Source and Target.")
+            warning.label(text="Put BOTH rigs in the same visible pose: T/T or A/A.")
+            warning.label(text="Pose Mode only. Do not change Rest Pose, Bone Roll or Edit Mode.")
+
+            row = calibration.row(align=True)
+            op = row.operator("kt_mrt.clear_calibration_pose", text="Reset Source Pose")
+            op.which = 'SOURCE'
+            op = row.operator("kt_mrt.clear_calibration_pose", text="Reset Target Pose")
+            op.which = 'TARGET'
+
+            capture = calibration.row(align=True)
+            capture.scale_y = 1.25
+            capture.operator("kt_mrt.capture_reference_pose", text="Capture Reference Pose", icon='KEY_HLT')
+            calibration.operator("kt_mrt.toggle_calibration_mode", text="Exit Calibration MODE / Restore Animation")
+        elif not settings.has_calibration:
+            calibration.label(text="Recommended when rigs use different A/T poses or bone axes.", icon='INFO')
+
+        # Everything below calibration waits until Calibration Mode is closed.
+        post = layout.column()
+        post.enabled = not settings.calibration_mode
+
+        if settings.mappings:
+            # IK belongs between Calibration and Validate.
+            ikbox = post.box()
+            ikrow = ikbox.row(align=True)
+            ikrow.operator(
+                "kt_mrt.toggle_target_ik",
+                text="Restore Target IK" if settings.ik_disabled else "Disable Target IK",
+                icon='CONSTRAINT_BONE',
+            )
+            if settings.ik_disabled:
+                ikrow.label(text="Target IK muted", icon='CHECKMARK')
+            else:
+                ikrow.label(text="Required if IK is active", icon='INFO')
+
+            validate = post.box()
+            row = validate.row(align=True)
+            row.operator("kt_mrt.validate", text="Validate", icon='CHECKMARK')
+            row.prop(settings, "bake_step")
+
+            log_header = validate.row(align=True)
+            log_header.prop(
+                settings, "show_validation_log", text="Validation Log",
+                icon='TRIA_DOWN' if settings.show_validation_log else 'TRIA_RIGHT',
+                emboss=True, toggle=True,
+            )
+
+            if settings.show_validation_log and settings.validation_report:
+                for line in settings.validation_report.splitlines():
+                    if line.startswith("ERROR"):
+                        validate.label(text=line, icon='ERROR')
+                    elif line.startswith("WARNING"):
+                        validate.label(text=line, icon='ERROR')
+                    elif line.startswith("READY"):
+                        validate.label(text=line, icon='CHECKMARK')
+                    else:
+                        validate.label(text=line)
+
+            actions = post.box()
+            row = actions.row(align=True)
+            row.scale_y = 1.35
+            row.operator("kt_mrt.preview", text="Build Preview")
+            row.operator("kt_mrt.bake", text="Bake Retarget")
+
+        if settings.status_message:
+            post.separator()
+            post.label(text=settings.status_message)
+
+
+class KTMRT_PT_BatchRename(Panel):
+    bl_label = "Batch Rename"
+    bl_order = 1
+    bl_idname = "KTMRT_PT_batch_rename"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'Retarget'
+    bl_options = {'DEFAULT_CLOSED'}
+
+    @classmethod
+    def poll(cls, context):
+        return kt_retarget_panels_visible(context)
+
+    def draw_header(self, context):
+        self.layout.label(text="", icon='SORTALPHA')
+
+    def draw(self, context):
+        layout = self.layout
+        settings = context.scene.kt_mrt_settings
+        layout.enabled = not settings.calibration_mode
+
+        row = layout.row(align=True)
+        row.prop(settings, "rename_armature", text="Rig")
+        row.operator("kt_mrt.use_selected_rename_rig", text="Use Selected")
+
+        layout.prop(settings, "rename_find", text="Find")
+        layout.prop(settings, "rename_replace", text="Replace")
+        layout.prop(settings, "rename_match_mode", text="Match")
+        layout.operator("kt_mrt.batch_rename_bones", text="Rename Bones")
+
+        if settings.rename_status:
+            layout.label(text=settings.rename_status)
+
+
+
+class KTMRT_PT_BoneOffset(Panel):
+    bl_label = "Add Bone Offset"
+    bl_order = 2
+    bl_idname = "KTMRT_PT_bone_offset"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'Retarget'
+    bl_options = {'DEFAULT_CLOSED'}
+
+    @classmethod
+    def poll(cls, context):
+        return kt_retarget_panels_visible(context)
+
+    def draw_header(self, context):
+        self.layout.label(text="", icon='CONSTRAINT_BONE')
+
+    def draw(self, context):
+        layout = self.layout
+        settings = context.scene.kt_mrt_settings
+        layout.enabled = not settings.calibration_mode
+
+        row = layout.row(align=True)
+        row.prop(settings, "offset_armature", text="Rig")
+        row.operator("kt_mrt.use_selected_offset_rig", text="Use Selected")
+        layout.prop(settings, "offset_action", text="Action")
+
+        rig = settings.offset_armature
+        if rig and rig.type == 'ARMATURE':
+            row = layout.row(align=True)
+            row.prop_search(settings, "offset_bone", rig.data, "bones", text="Bone")
+            row.operator("kt_mrt.use_active_offset_bone", text="", icon='BONE_DATA')
+        else:
+            layout.prop(settings, "offset_bone", text="Bone")
+
+        layout.prop(settings, "offset_space", text="Space")
+
+        if not settings.offset_editing:
+            row = layout.row(align=True)
+            row.scale_y = 1.2
+            row.operator("kt_mrt.start_bone_offset", text="Start Offset Edit", icon='REC')
+            layout.label(text="Capture current pose, then move/rotate the bone in Pose Mode.", icon='INFO')
+        else:
+            alert = layout.box()
+            alert.alert = True
+            alert.label(text="OFFSET EDIT ACTIVE", icon='INFO')
+            alert.label(text="Adjust the selected bone now; do not keyframe it manually.")
+            row = layout.row(align=True)
+            row.scale_y = 1.2
+            row.operator("kt_mrt.apply_bone_offset", text="Apply Offset to Action", icon='KEY_HLT')
+            row.operator("kt_mrt.cancel_bone_offset", text="Cancel", icon='X')
+
+        if settings.offset_status:
+            layout.label(text=settings.offset_status)
+
+
+class KTMRT_PT_CopyBoneAnimation(Panel):
+    bl_label = "Copy Bone Animation"
+    bl_order = 3
+    bl_idname = "KTMRT_PT_copy_bone_animation"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'Retarget'
+    bl_options = {'DEFAULT_CLOSED'}
+
+    @classmethod
+    def poll(cls, context):
+        return kt_retarget_panels_visible(context)
+
+    def draw_header(self, context):
+        self.layout.label(text="", icon='DUPLICATE')
+
+    def draw(self, context):
+        layout = self.layout
+        settings = context.scene.kt_mrt_settings
+        layout.enabled = not settings.calibration_mode
+
+        # One collapsible, unified setup area for both rigs/actions.
+        setup = layout.box()
+        header = setup.row(align=True)
+        header.prop(
+            settings,
+            "copy_setup_expanded",
+            text="Source & Target",
+            icon='TRIA_DOWN' if settings.copy_setup_expanded else 'TRIA_RIGHT',
+            toggle=True,
+        )
+
+        if settings.copy_setup_expanded:
+            source_box = setup.box()
+            source_box.label(text="Source", icon='ACTION')
+            row = source_box.row(align=True)
+            row.prop(settings, "copy_source_armature", text="Rig")
+            op = row.operator("kt_mrt.use_selected_copy_rig", text="Use Selected")
+            op.role = 'SOURCE'
+            row = source_box.row(align=True)
+            row.prop(settings, "copy_source_action", text="Action")
+            op = row.operator("kt_mrt.use_current_copy_action", text="Use Current")
+            op.role = 'SOURCE'
+
+            target_box = setup.box()
+            target_box.label(text="Target", icon='ARMATURE_DATA')
+            row = target_box.row(align=True)
+            row.prop(settings, "copy_target_armature", text="Rig")
+            op = row.operator("kt_mrt.use_selected_copy_rig", text="Use Selected")
+            op.role = 'TARGET'
+            row = target_box.row(align=True)
+            row.prop(settings, "copy_target_action", text="Base Action")
+            op = row.operator("kt_mrt.use_current_copy_action", text="Use Current")
+            op.role = 'TARGET'
+            target_box.prop(settings, "copy_output_mode", text="Action Output")
+
+        mappings = layout.box()
+        mappings.label(text="Bone Copies", icon='BONE_DATA')
+
+        header = mappings.row(align=True)
+        source_head = header.row(align=True)
+        source_head.scale_x = 1.0
+        source_head.label(text="Source Bone")
+        header.label(text="")
+        target_head = header.row(align=True)
+        target_head.scale_x = 1.0
+        target_head.label(text="Write To Bone")
+        header.label(text="R")
+        header.label(text="L")
+        header.label(text="S")
+
+        list_row = mappings.row(align=True)
+        list_row.template_list(
+            "KTMRT_UL_CopyMappings",
+            "",
+            settings,
+            "copy_destinations",
+            settings,
+            "copy_destination_index",
+            rows=6,
+        )
+
+        tools = list_row.column(align=True)
+        tools.operator("kt_mrt.add_copy_destination", text="", icon='ADD')
+        tools.operator("kt_mrt.remove_copy_destination", text="", icon='REMOVE')
+        tools.separator(factor=0.4)
+        tools.operator("kt_mrt.duplicate_copy_destination", text="", icon='DUPLICATE')
+        tools.operator("kt_mrt.clear_copy_destinations", text="", icon='TRASH')
+
+        row = mappings.row(align=True)
+        row.operator("kt_mrt.use_active_copy_source", text="Set Source from Active", icon='EYEDROPPER')
+        row.operator("kt_mrt.use_active_copy_target", text="Set Target from Active", icon='EYEDROPPER')
+
+        row = mappings.row(align=True)
+        row.operator(
+            "kt_mrt.add_selected_copy_destinations",
+            text="Add Selected Target Bones",
+            icon='ADD',
+        )
+
+        button = layout.row(align=True)
+        button.scale_y = 1.2
+        direct_write = settings.copy_output_mode == 'CURRENT'
+        button.alert = direct_write
+        button.operator(
+            "kt_mrt.copy_bone_animation",
+            text="Copy into Target Action" if direct_write else "Copy to New Action",
+            icon='ACTION',
+        )
+
+        if direct_write:
+            layout.label(text="The selected Target Action will be modified directly.", icon='ERROR')
+        elif settings.copy_target_action:
+            layout.label(text="The Base Action is preserved; a modified copy will be created.", icon='INFO')
+        else:
+            layout.label(text="No Base Action selected: a new empty Action will be created.", icon='INFO')
+
+        if settings.copy_status:
+            layout.label(text=settings.copy_status)
+
+
+# -----------------------------------------------------------------------------
+# Registration
+# -----------------------------------------------------------------------------
+
+KTMRT_CLASSES = (
+    KTMRT_MappingItem,
+    KTMRT_CopyDestinationItem,
+    KTMRT_Settings,
+    KTMRT_UL_Mappings,
+    KTMRT_UL_CopyMappings,
+    KTMRT_OT_UseSelectedSource,
+    KTMRT_OT_UseSelectedTarget,
+    KTMRT_OT_ClearMapping,
+    KTMRT_OT_ClearAllMappings,
+    KTMRT_OT_UseSelectedRenameRig,
+    KTMRT_OT_BatchRenameBones,
+    KTMRT_OT_ToggleCalibrationMode,
+    KTMRT_OT_ClearCalibrationPose,
+    KTMRT_OT_CaptureReferencePose,
+    KTMRT_OT_ClearReferencePose,
+    KTMRT_OT_ToggleTargetIK,
+    KTMRT_OT_Analyze,
+    KTMRT_OT_AutoMap,
+    KTMRT_OT_DebugSelectedMapping,
+    KTMRT_OT_Validate,
+    KTMRT_OT_Preview,
+    KTMRT_OT_Bake,
+    KTMRT_OT_SavePreset,
+    KTMRT_OT_LoadPreset,
+    KTMRT_OT_OpenPresetFolder,
+    KTMRT_OT_UseSelectedOffsetRig,
+    KTMRT_OT_UseActiveOffsetBone,
+    KTMRT_OT_StartBoneOffset,
+    KTMRT_OT_CancelBoneOffset,
+    KTMRT_OT_ApplyBoneOffset,
+    KTMRT_OT_UseSelectedCopyRig,
+    KTMRT_OT_UseCurrentCopyAction,
+    KTMRT_OT_UseActiveCopySource,
+    KTMRT_OT_UseActiveCopyTarget,
+    KTMRT_OT_AddCopyDestination,
+    KTMRT_OT_DuplicateCopyDestination,
+    KTMRT_OT_RemoveCopyDestination,
+    KTMRT_OT_ClearCopyDestinations,
+    KTMRT_OT_AddSelectedCopyDestinations,
+    KTMRT_OT_CopyBoneAnimation,
+    KTMRT_PT_Main,
+    KTMRT_PT_BatchRename,
+    KTMRT_PT_BoneOffset,
+    KTMRT_PT_CopyBoneAnimation,
+)
+
+
+
 # ------------------------------------------------------------
 # Register
 # ------------------------------------------------------------
@@ -2937,13 +7396,26 @@ classes = (
     KT_OT_apply_controller_color,
     RIGTOOLS_OT_merge_bones,
     KT_OT_clean_actions,
+    KT_OT_toggle_retarget,
     KT_OT_update_addon,
 )
 
 
 def register():
+    # Register the embedded Retarget RNA types first.
+    for cls in KTMRT_CLASSES:
+        bpy.utils.register_class(cls)
+
     for cls in classes:
         bpy.utils.register_class(cls)
+
+    bpy.types.Scene.kt_mrt_settings = PointerProperty(type=KTMRT_Settings)
+
+    bpy.types.Scene.kt_retarget_enabled = bpy.props.BoolProperty(
+        name="Retarget",
+        description="Show the integrated Retarget sidebar tab",
+        default=False,
+    )
         
     bpy.types.Scene.cursor_align_enabled = bpy.props.BoolProperty(
         name="Edit 3D Cursor",
@@ -3071,6 +7543,12 @@ def register():
 def unregister():
     unregister_keymaps()
 
+    if hasattr(bpy.types.Scene, "kt_mrt_settings"):
+        del bpy.types.Scene.kt_mrt_settings
+
+    if hasattr(bpy.types.Scene, "kt_retarget_enabled"):
+        del bpy.types.Scene.kt_retarget_enabled
+
     if hasattr(bpy.types.Scene, "cursor_align_enabled"):
         del bpy.types.Scene.cursor_align_enabled
 
@@ -3117,6 +7595,9 @@ def unregister():
         del bpy.types.Object.rigtools_bone_b
 
     for cls in reversed(classes):
+        bpy.utils.unregister_class(cls)
+
+    for cls in reversed(KTMRT_CLASSES):
         bpy.utils.unregister_class(cls)
         
     del bpy.types.Scene.ct_edit_bg_color
