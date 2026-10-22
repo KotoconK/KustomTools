@@ -2,7 +2,7 @@
 bl_info = {
     "name": "KustomTools",
     "author": "Álvaro_A",
-    "version": (2, 0, 1),
+    "version": (2, 0, 2),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Kustom Tools",
     "description": "General art, modeling, rigging and integrated motion-retarget tools",
@@ -841,6 +841,12 @@ class KT_OT_delete_unused_materials(bpy.types.Operator):
         ):
             context.scene.kt_remove_material_name = ""
 
+        if (
+            context.scene.kt_apply_material_name
+            and bpy.data.materials.get(context.scene.kt_apply_material_name) is None
+        ):
+            context.scene.kt_apply_material_name = ""
+
         self.report(
             {'INFO'},
             f"Deleted {count} unused material{'s' if count != 1 else ''}"
@@ -951,6 +957,75 @@ class KT_OT_select_by_material(bpy.types.Operator):
 
         self.report({'WARNING'}, "Use this tool in Object Mode or Mesh Edit Mode")
         return {'CANCELLED'}
+
+
+class KT_OT_apply_material_to_selected(bpy.types.Operator):
+    bl_idname = "kt.apply_material_to_selected"
+    bl_label = "Apply to Sel"
+    bl_description = "Add the chosen existing material to the material slots of all selected mesh objects"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == 'OBJECT'
+
+    def execute(self, context):
+        material_name = context.scene.kt_apply_material_name.strip()
+        material = bpy.data.materials.get(material_name)
+
+        if material is None:
+            self.report({'WARNING'}, "Choose a valid material first")
+            return {'CANCELLED'}
+
+        selected_meshes = [
+            obj for obj in context.selected_objects
+            if obj.type == 'MESH'
+        ]
+
+        if not selected_meshes:
+            self.report({'WARNING'}, "Select at least one mesh object")
+            return {'CANCELLED'}
+
+        processed_mesh_data = set()
+        added_slots = 0
+        already_present = 0
+
+        for obj in selected_meshes:
+            mesh_key = obj.data.as_pointer()
+
+            # Material slots live on the Mesh datablock. Shared/instanced meshes
+            # therefore need to be edited only once.
+            if mesh_key in processed_mesh_data:
+                continue
+
+            processed_mesh_data.add(mesh_key)
+
+            if any(slot.material == material for slot in obj.material_slots):
+                already_present += 1
+                continue
+
+            obj.data.materials.append(material)
+            added_slots += 1
+
+        if added_slots == 0:
+            self.report(
+                {'INFO'},
+                f"{material.name} is already in the selected object's material slots"
+                if len(processed_mesh_data) == 1
+                else f"{material.name} is already in all selected mesh material slots"
+            )
+            return {'FINISHED'}
+
+        message = (
+            f"Added {material.name} to {added_slots} mesh datablock"
+            f"{'s' if added_slots != 1 else ''}"
+        )
+
+        if already_present:
+            message += f" · {already_present} already had it"
+
+        self.report({'INFO'}, message)
+        return {'FINISHED'}
 
 
 class KT_OT_remove_material_from_selected(bpy.types.Operator):
@@ -2645,6 +2720,27 @@ class VIEW3D_PT_material_tools(bpy.types.Panel):
         layout = self.layout
         scene = context.scene
         col = layout.column(align=True)
+
+        # --------------------------------------------------------
+        # APPLY EXISTING MATERIAL
+        # --------------------------------------------------------
+        box = col.box()
+        row = box.row(align=True)
+        row.prop_search(
+            scene,
+            "kt_apply_material_name",
+            bpy.data,
+            "materials",
+            text=""
+        )
+
+        button = row.row(align=True)
+        button.enabled = context.mode == 'OBJECT'
+        button.operator(
+            "kt.apply_material_to_selected",
+            text="Apply to Sel",
+            icon='MATERIAL'
+        )
 
         # --------------------------------------------------------
         # SELECT BY MATERIAL - COLLAPSIBLE
@@ -7268,6 +7364,7 @@ classes = (
     CT_OT_set_active_object_color,
     KT_OT_delete_unused_materials,
     KT_OT_select_by_material,
+    KT_OT_apply_material_to_selected,
     KT_OT_remove_material_from_selected,
     KT_OT_quadrangulate_loop,
     KT_OT_circularize_loop,
@@ -7353,6 +7450,12 @@ def register():
     bpy.types.Scene.kt_remove_material_name = bpy.props.StringProperty(
         name="Material",
         description="Material to remove from selected objects",
+        default="",
+    )
+
+    bpy.types.Scene.kt_apply_material_name = bpy.props.StringProperty(
+        name="Material",
+        description="Existing material to add to the selected mesh objects",
         default="",
     )
 
@@ -7447,6 +7550,9 @@ def unregister():
 
     if hasattr(bpy.types.Scene, "kt_remove_material_name"):
         del bpy.types.Scene.kt_remove_material_name
+
+    if hasattr(bpy.types.Scene, "kt_apply_material_name"):
+        del bpy.types.Scene.kt_apply_material_name
 
     if hasattr(bpy.types.Scene, "kt_select_material_expanded"):
         del bpy.types.Scene.kt_select_material_expanded
